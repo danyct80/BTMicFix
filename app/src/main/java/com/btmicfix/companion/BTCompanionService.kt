@@ -44,7 +44,7 @@ class BTCompanionService : CompanionDeviceService() {
         Logger.i("🎧 Device appeared: association=${associationInfo.id}")
 
         // Start a foreground service to keep the routing active
-        startForegroundWithNotification("Connecting…")
+        startForegroundWithNotification("Connessione…")
 
         // Apply the audio routing fix
         audioRoutingManager.startMonitoring()
@@ -53,11 +53,11 @@ class BTCompanionService : CompanionDeviceService() {
         when (result) {
             is AudioRoutingManager.RoutingState.Active -> {
                 Logger.i("✓ Background routing activated: ${result.deviceName}")
-                updateNotification("Mic routed to ${result.deviceName}")
+                updateNotification("Microfono instradato su ${result.deviceName}")
             }
             is AudioRoutingManager.RoutingState.Failed -> {
                 Logger.e("✗ Background routing failed: ${result.reason}")
-                updateNotification("Routing failed — tap to retry")
+                updateNotification("Instradamento non riuscito — tocca per riprovare")
             }
             else -> {
                 Logger.w("Unexpected routing state: $result")

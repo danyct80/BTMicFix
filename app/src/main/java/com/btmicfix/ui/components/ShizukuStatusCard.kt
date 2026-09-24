@@ -33,31 +33,31 @@ fun ShizukuStatusCard(
     val (icon, statusText, statusColor, actionLabel) = when (status) {
         ShizukuStatus.UNKNOWN -> ShizukuDisplayInfo(
             icon = Icons.Default.Info,
-            text = "Checking Shizuku…",
+            text = "Controllo Shizuku…",
             color = StatusIdle,
             action = null,
         )
         ShizukuStatus.NOT_INSTALLED -> ShizukuDisplayInfo(
             icon = Icons.Default.Close,
-            text = "Shizuku not installed (optional)",
+            text = "Shizuku non installato (facoltativo)",
             color = StatusIdle,
             action = null,
         )
         ShizukuStatus.NOT_RUNNING -> ShizukuDisplayInfo(
             icon = Icons.Default.Warning,
-            text = "Shizuku not running",
+            text = "Shizuku non in esecuzione",
             color = StatusRouting,
             action = null,
         )
         ShizukuStatus.PERMISSION_NEEDED -> ShizukuDisplayInfo(
             icon = Icons.Default.Warning,
-            text = "Shizuku permission needed",
+            text = "Autorizzazione Shizuku necessaria",
             color = StatusRouting,
-            action = "Grant Permission",
+            action = "Concedi autorizzazione",
         )
         ShizukuStatus.READY -> ShizukuDisplayInfo(
             icon = Icons.Default.CheckCircle,
-            text = "Shizuku ready (fallback enabled)",
+            text = "Shizuku pronto (alternativa attiva)",
             color = StatusActive,
             action = null,
         )

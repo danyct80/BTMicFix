@@ -40,25 +40,25 @@ fun StatusCard(
         is RoutingState.Idle -> StatusInfo(
             color = StatusIdle,
             icon = Icons.Default.BluetoothDisabled,
-            title = "Idle",
-            subtitle = "No Bluetooth device routed",
+            title = "Inattivo",
+            subtitle = "Nessun dispositivo Bluetooth in uso",
         )
         is RoutingState.Routing -> StatusInfo(
             color = StatusRouting,
             icon = Icons.Default.BluetoothConnected,
-            title = "Routing…",
-            subtitle = "Connecting to ${routingState.deviceName}",
+            title = "Instradamento…",
+            subtitle = "Connessione a ${routingState.deviceName}",
         )
         is RoutingState.Active -> StatusInfo(
             color = StatusActive,
             icon = Icons.Default.Mic,
-            title = "Active",
-            subtitle = "Mic routed to ${routingState.deviceName}",
+            title = "Attivo",
+            subtitle = "Microfono instradato su ${routingState.deviceName}",
         )
         is RoutingState.Failed -> StatusInfo(
             color = StatusFailed,
             icon = Icons.Default.Error,
-            title = "Failed",
+            title = "Non riuscito",
             subtitle = routingState.reason,
         )
     }

@@ -83,28 +83,29 @@ fun SetupScreen(
         notificationPermissionGranted = granted
     }
 
+    // Dispositivi associati (letti dal sistema: restano corretti anche dopo un riavvio dell'app)
+    var associatedNames by remember { mutableStateOf(companionManager.getAssociatedDeviceNames()) }
+
     // CDM association launcher
     val cdmLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult()
     ) { result ->
-        // Association result handled via CDM callback
+        // Dopo la scelta nella finestra di sistema, aggiorna il nome mostrato
+        associatedNames = companionManager.getAssociatedDeviceNames()
     }
-
-    // Paired device info
-    val pairedDeviceName = preferences.pairedDeviceName
 
     Scaffold(
         modifier = modifier,
         topBar = {
             TopAppBar(
                 title = {
-                    Text("Setup", fontWeight = FontWeight.Bold)
+                    Text("Configurazione", fontWeight = FontWeight.Bold)
                 },
                 navigationIcon = {
                     IconButton(onClick = onBackClick) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Back",
+                            contentDescription = "Indietro",
                             tint = Purple80,
                         )
                     }
@@ -128,7 +129,7 @@ fun SetupScreen(
             Spacer(modifier = Modifier.height(8.dp))
 
             Text(
-                text = "Complete these steps to enable automatic Bluetooth mic routing.",
+                text = "Completa questi passaggi per attivare l'instradamento automatico del microfono Bluetooth.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -138,10 +139,10 @@ fun SetupScreen(
             // Step 1: Bluetooth Permission
             SetupStepCard(
                 stepNumber = 1,
-                title = "Bluetooth Permission",
-                description = "Required to detect and communicate with your earbuds.",
+                title = "Autorizzazione Bluetooth",
+                description = "Necessaria per rilevare i tuoi auricolari e comunicare con essi.",
                 isComplete = bluetoothPermissionGranted,
-                actionLabel = if (bluetoothPermissionGranted) null else "Grant",
+                actionLabel = if (bluetoothPermissionGranted) null else "Concedi",
                 onAction = {
                     btPermissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
                 },
@@ -151,10 +152,10 @@ fun SetupScreen(
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 SetupStepCard(
                     stepNumber = 2,
-                    title = "Notification Permission",
-                    description = "Needed to show routing status while active in background.",
+                    title = "Autorizzazione notifiche",
+                    description = "Serve a mostrare lo stato dell'instradamento quando è attivo in background.",
                     isComplete = notificationPermissionGranted,
-                    actionLabel = if (notificationPermissionGranted) null else "Grant",
+                    actionLabel = if (notificationPermissionGranted) null else "Concedi",
                     onAction = {
                         notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                     },
@@ -164,16 +165,16 @@ fun SetupScreen(
             // Step 3: Shizuku (Optional)
             SetupStepCard(
                 stepNumber = 3,
-                title = "Shizuku (Optional)",
-                description = "Provides advanced fallback routing for stubborn devices. Not required for most users.",
+                title = "Shizuku (facoltativo)",
+                description = "Offre un instradamento alternativo avanzato per i dispositivi problematici. Non necessario per la maggior parte degli utenti.",
                 isComplete = shizukuStatus == ShizukuStatus.READY,
                 isOptional = true,
                 actionLabel = when (shizukuStatus) {
-                    ShizukuStatus.NOT_INSTALLED -> "Install Shizuku"
-                    ShizukuStatus.NOT_RUNNING -> "Start Shizuku"
-                    ShizukuStatus.PERMISSION_NEEDED -> "Grant Permission"
+                    ShizukuStatus.NOT_INSTALLED -> "Installa Shizuku"
+                    ShizukuStatus.NOT_RUNNING -> "Avvia Shizuku"
+                    ShizukuStatus.PERMISSION_NEEDED -> "Concedi autorizzazione"
                     ShizukuStatus.READY -> null
-                    ShizukuStatus.UNKNOWN -> "Check"
+                    ShizukuStatus.UNKNOWN -> "Controlla"
                 },
                 onAction = {
                     when (shizukuStatus) {
@@ -198,36 +199,42 @@ fun SetupScreen(
             // Step 4: Pair Earbuds via CDM
             SetupStepCard(
                 stepNumber = 4,
-                title = "Pair Earbuds",
-                description = if (pairedDeviceName != null) {
-                    "Paired with $pairedDeviceName. Routing will activate automatically when connected."
+                title = "Associa auricolari",
+                description = if (associatedNames.isNotEmpty()) {
+                    "L'instradamento si attiverà automaticamente quando l'auricolare si connette."
                 } else {
-                    "Associate your Bluetooth earbuds for automatic background routing."
+                    "Associa i tuoi auricolari Bluetooth per l'instradamento automatico in background."
                 },
-                isComplete = pairedDeviceName != null,
-                actionLabel = if (pairedDeviceName != null) "Re-pair" else "Pair Device",
+                detail = if (associatedNames.isNotEmpty()) {
+                    (if (associatedNames.size == 1) "Associato: " else "Associati: ") +
+                        associatedNames.joinToString(", ")
+                } else null,
+                isComplete = associatedNames.isNotEmpty(),
+                actionLabel = if (associatedNames.isNotEmpty()) "Associa un altro dispositivo" else "Associa dispositivo",
                 onAction = {
-                    companionManager.startAssociation(cdmLauncher)
+                    companionManager.startAssociation(cdmLauncher) {
+                        associatedNames = companionManager.getAssociatedDeviceNames()
+                    }
                 },
             )
 
             // Step 5: Test Routing
             SetupStepCard(
                 stepNumber = 5,
-                title = "Test Routing",
+                title = "Prova instradamento",
                 description = when (routingState) {
                     is AudioRoutingManager.RoutingState.Active ->
-                        "✓ Routing active! Your BT mic should now work in AI apps."
+                        "✓ Instradamento attivo! Il microfono Bluetooth ora dovrebbe funzionare nelle app di IA."
                     is AudioRoutingManager.RoutingState.Failed ->
-                        "✗ Routing failed. Make sure earbuds are connected."
+                        "✗ Instradamento non riuscito. Verifica che gli auricolari siano connessi."
                     else ->
-                        "Connect your earbuds and tap Test to verify mic routing works."
+                        "Connetti gli auricolari e tocca Prova per verificare che il microfono venga instradato."
                 },
                 isComplete = routingState is AudioRoutingManager.RoutingState.Active,
                 actionLabel = when (routingState) {
-                    is AudioRoutingManager.RoutingState.Active -> "Stop"
+                    is AudioRoutingManager.RoutingState.Active -> "Ferma"
                     is AudioRoutingManager.RoutingState.Routing -> null
-                    else -> "Test"
+                    else -> "Prova"
                 },
                 onAction = {
                     if (routingState is AudioRoutingManager.RoutingState.Active) {
@@ -253,6 +260,7 @@ private fun SetupStepCard(
     description: String,
     isComplete: Boolean,
     isOptional: Boolean = false,
+    detail: String? = null,
     actionLabel: String? = null,
     onAction: () -> Unit = {},
 ) {
@@ -284,7 +292,7 @@ private fun SetupStepCard(
                 if (isComplete) {
                     Icon(
                         imageVector = Icons.Default.Check,
-                        contentDescription = "Complete",
+                        contentDescription = "Completato",
                         tint = StatusActive,
                         modifier = Modifier.size(18.dp),
                     )
@@ -314,7 +322,7 @@ private fun SetupStepCard(
                             color = StatusIdle.copy(alpha = 0.2f),
                         ) {
                             Text(
-                                text = "OPTIONAL",
+                                text = "FACOLTATIVO",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = StatusIdle,
                                 modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
@@ -330,6 +338,16 @@ private fun SetupStepCard(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+
+                if (detail != null) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = detail,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = StatusActive,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
 
                 if (actionLabel != null) {
                     Spacer(modifier = Modifier.height(8.dp))

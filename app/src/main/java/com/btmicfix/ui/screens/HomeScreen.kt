@@ -57,7 +57,7 @@ fun HomeScreen(
                     IconButton(onClick = onSetupClick) {
                         Icon(
                             imageVector = Icons.Default.Settings,
-                            contentDescription = "Setup",
+                            contentDescription = "Configurazione",
                             tint = Purple80,
                         )
                     }
@@ -138,7 +138,7 @@ private fun RoutingControlButton(
                     modifier = Modifier.size(20.dp),
                 )
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("Enable Routing", style = MaterialTheme.typography.labelLarge)
+                Text("Attiva instradamento", style = MaterialTheme.typography.labelLarge)
             }
         }
         is RoutingState.Routing -> {
@@ -161,7 +161,7 @@ private fun RoutingControlButton(
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    "Routing…",
+                    "Instradamento…",
                     style = MaterialTheme.typography.labelLarge,
                     color = StatusRouting,
                 )
@@ -182,7 +182,7 @@ private fun RoutingControlButton(
                     modifier = Modifier.size(20.dp),
                 )
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("Disable Routing", style = MaterialTheme.typography.labelLarge)
+                Text("Disattiva instradamento", style = MaterialTheme.typography.labelLarge)
             }
         }
         is RoutingState.Failed -> {
@@ -200,7 +200,7 @@ private fun RoutingControlButton(
                     modifier = Modifier.size(20.dp),
                 )
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("Retry", style = MaterialTheme.typography.labelLarge)
+                Text("Riprova", style = MaterialTheme.typography.labelLarge)
             }
         }
     }
@@ -221,16 +221,16 @@ private fun HowItWorksCard() {
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Text(
-                text = "How it works",
+                text = "Come funziona",
                 style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.onSurface,
             )
 
             val steps = listOf(
-                "AI apps like ChatGPT fail to switch your Bluetooth earbuds from music mode (A2DP) to mic mode (SCO/HFP).",
-                "BTMicFix forces this switch using Android's setCommunicationDevice API.",
-                "Once enabled, your earbuds' microphone becomes the active input for all voice apps.",
-                "With background mode, this happens automatically whenever your earbuds connect.",
+                "Le app di intelligenza artificiale come ChatGPT non riescono a far passare i tuoi auricolari Bluetooth dalla modalità musica (A2DP) alla modalità microfono (SCO/HFP).",
+                "BTMicFix forza questo passaggio usando l'API setCommunicationDevice di Android.",
+                "Una volta attivato, il microfono dei tuoi auricolari diventa l'ingresso attivo per tutte le app vocali.",
+                "Con la modalità in background, questo avviene automaticamente ogni volta che gli auricolari si connettono.",
             )
 
             steps.forEachIndexed { index, step ->

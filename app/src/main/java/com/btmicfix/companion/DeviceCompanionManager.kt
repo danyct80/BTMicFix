@@ -39,7 +39,10 @@ class DeviceCompanionManager(private val context: Context) {
      *
      * @param launcher The ActivityResultLauncher to handle the association result.
      */
-    fun startAssociation(launcher: ActivityResultLauncher<IntentSenderRequest>) {
+    fun startAssociation(
+        launcher: ActivityResultLauncher<IntentSenderRequest>,
+        onAssociated: () -> Unit = {},
+    ) {
         val cdm = companionDeviceManager ?: run {
             Logger.e("CompanionDeviceManager not available on this device")
             return
@@ -74,6 +77,10 @@ class DeviceCompanionManager(private val context: Context) {
                 Logger.i("CDM association created: ${associationInfo.id}")
                 // Start observing presence for this association
                 startObservingPresence(associationInfo.id)
+                // Salva nome e indirizzo del dispositivo appena associato
+                preferences.pairedDeviceName = associationInfo.displayName?.toString()
+                preferences.pairedDeviceAddress = associationInfo.deviceMacAddress?.toString()
+                onAssociated()
             }
 
             override fun onFailure(error: CharSequence?) {
@@ -124,6 +131,17 @@ class DeviceCompanionManager(private val context: Context) {
             emptyList()
         }
     }
+
+    /**
+     * Nomi leggibili dei dispositivi associati, letti direttamente dal sistema.
+     * Se il nome non è disponibile mostra l'indirizzo Bluetooth.
+     */
+    fun getAssociatedDeviceNames(): List<String> =
+        getAssociations().map { info ->
+            info.displayName?.toString()
+                ?: info.deviceMacAddress?.toString()
+                ?: "Dispositivo sconosciuto"
+        }
 
     /**
      * Remove an association (unpair from CDM — does not affect Bluetooth pairing).

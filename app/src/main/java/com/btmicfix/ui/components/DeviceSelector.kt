@@ -32,7 +32,7 @@ fun DeviceSelector(
             modifier = Modifier.padding(16.dp),
         ) {
             Text(
-                text = "Bluetooth Devices",
+                text = "Dispositivi Bluetooth",
                 style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.onSurface,
             )
@@ -54,7 +54,7 @@ fun DeviceSelector(
                     )
                     Spacer(modifier = Modifier.width(12.dp))
                     Text(
-                        text = "No Bluetooth audio devices connected",
+                        text = "Nessun dispositivo audio Bluetooth connesso",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -113,7 +113,7 @@ private fun DeviceRow(
 
             Icon(
                 imageVector = Icons.Default.Bluetooth,
-                contentDescription = "Route to device",
+                contentDescription = "Instrada verso il dispositivo",
                 tint = Purple40,
                 modifier = Modifier.size(20.dp),
             )

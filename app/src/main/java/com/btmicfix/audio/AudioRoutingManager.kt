@@ -104,7 +104,7 @@ class AudioRoutingManager(private val context: Context) {
      * @return The resulting [RoutingState] after the attempt.
      */
     fun routeToBluetooth(device: AudioDeviceInfo): RoutingState {
-        val deviceName = device.productName?.toString() ?: "Bluetooth Device"
+        val deviceName = device.productName?.toString() ?: "Dispositivo Bluetooth"
         Logger.i("Attempting to route to: $deviceName (type=${deviceTypeToString(device.type)})")
 
         _routingState.value = RoutingState.Routing(deviceName)
@@ -125,14 +125,14 @@ class AudioRoutingManager(private val context: Context) {
                 Logger.i("✓ Routing active: $deviceName")
                 return state
             } else {
-                val state = RoutingState.Failed("setCommunicationDevice returned false")
+                val state = RoutingState.Failed("setCommunicationDevice ha restituito false")
                 _routingState.value = state
                 Logger.e("✗ setCommunicationDevice failed for $deviceName")
                 audioManager.mode = AudioManager.MODE_NORMAL
                 return state
             }
         } catch (e: Exception) {
-            val state = RoutingState.Failed(e.message ?: "Unknown error")
+            val state = RoutingState.Failed(e.message ?: "Errore sconosciuto")
             _routingState.value = state
             Logger.e("✗ Exception during routing", e)
             audioManager.mode = AudioManager.MODE_NORMAL
@@ -147,7 +147,7 @@ class AudioRoutingManager(private val context: Context) {
     fun routeToFirstAvailableBluetooth(): RoutingState {
         val btDevice = findFirstBluetoothCommunicationDevice()
         if (btDevice == null) {
-            val state = RoutingState.Failed("No Bluetooth communication device found")
+            val state = RoutingState.Failed("Nessun dispositivo di comunicazione Bluetooth trovato")
             _routingState.value = state
             Logger.w("No BT communication devices available")
             return state
@@ -163,7 +163,7 @@ class AudioRoutingManager(private val context: Context) {
             deviceInfo.address == address
         }
         if (targetDevice == null) {
-            val state = RoutingState.Failed("Paired device not found in available devices")
+            val state = RoutingState.Failed("Dispositivo associato non trovato tra quelli disponibili")
             _routingState.value = state
             Logger.w("Device with address ${if (BuildConfig.DEBUG) address else "REDACTED"} not found")
             return state
@@ -226,7 +226,7 @@ class AudioRoutingManager(private val context: Context) {
             .map { device ->
                 BluetoothAudioDevice(
                     deviceInfo = device,
-                    name = device.productName?.toString() ?: "Unknown BT Device",
+                    name = device.productName?.toString() ?: "Dispositivo BT sconosciuto",
                     type = device.type,
                     typeLabel = deviceTypeToString(device.type),
                 )
@@ -243,14 +243,14 @@ class AudioRoutingManager(private val context: Context) {
         fun deviceTypeToString(type: Int): String = when (type) {
             AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "BT SCO"
             AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "BT A2DP"
-            AudioDeviceInfo.TYPE_BLE_HEADSET -> "BLE Headset"
-            AudioDeviceInfo.TYPE_BLE_SPEAKER -> "BLE Speaker"
-            AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Built-in Mic"
-            AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "Built-in Speaker"
-            AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Wired Headset"
-            AudioDeviceInfo.TYPE_USB_DEVICE -> "USB Device"
-            AudioDeviceInfo.TYPE_USB_HEADSET -> "USB Headset"
-            else -> "Type $type"
+            AudioDeviceInfo.TYPE_BLE_HEADSET -> "Cuffie BLE"
+            AudioDeviceInfo.TYPE_BLE_SPEAKER -> "Altoparlante BLE"
+            AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Microfono integrato"
+            AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "Altoparlante integrato"
+            AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Cuffie con filo"
+            AudioDeviceInfo.TYPE_USB_DEVICE -> "Dispositivo USB"
+            AudioDeviceInfo.TYPE_USB_HEADSET -> "Cuffie USB"
+            else -> "Tipo $type"
         }
     }
 }
