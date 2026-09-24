@@ -213,6 +213,43 @@ class AudioRoutingManager(private val context: Context) {
     }
 
     /**
+     * Re-assert the currently selected Bluetooth communication device without changing
+     * the user's selection. Useful when Android Auto or an OEM audio policy steals the
+     * communication route after the initial setCommunicationDevice() call.
+     *
+     * @return true when Android accepted the re-assertion.
+     */
+    fun reassertCurrentRouting(): Boolean {
+        val device = currentRoutedDevice ?: findFirstBluetoothCommunicationDevice() ?: return false
+        return try {
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            val success = audioManager.setCommunicationDevice(device)
+            if (success) {
+                currentRoutedDevice = device
+                val deviceName = device.productName?.toString() ?: "Dispositivo Bluetooth"
+                _routingState.value = RoutingState.Active(deviceName)
+                Logger.d("Routing re-asserted on $deviceName")
+            } else {
+                Logger.w("Routing re-assertion rejected")
+            }
+            success
+        } catch (e: Exception) {
+            Logger.e("Routing re-assertion failed", e)
+            false
+        }
+    }
+
+    /** Current Android communication device, useful for diagnostics. */
+    fun currentCommunicationDeviceLabel(): String {
+        val device = audioManager.communicationDevice
+        return if (device == null) {
+            "Nessun communication device"
+        } else {
+            "${device.productName ?: "Dispositivo"} (${deviceTypeToString(device.type)})"
+        }
+    }
+
+    /**
      * Refresh the list of available Bluetooth audio devices.
      */
     private fun refreshAvailableDevices() {

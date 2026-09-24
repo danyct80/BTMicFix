@@ -103,3 +103,38 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ```
+
+---
+
+## Android Auto / W622 experimental Shizuku fallback (0.2.0-aa)
+
+This fork adds an explicit privileged fallback for the motorcycle Android Auto case where
+`setCommunicationDevice()` reports success but Gemini/Assistant still loses the Bluetooth mic.
+
+### What changed
+
+- Shizuku now binds a real UserService and reports whether that service is actually connected.
+- Added **FORZA CARDO ORA (SHIZUKU)**:
+  1. re-asserts the selected Bluetooth SCO communication device;
+  2. attempts to force Android audio policy `FOR_COMMUNICATION` and `FOR_RECORD` to `FORCE_BT_SCO`.
+- Added **LOCK ROUTING PER 30 SECONDI** to re-assert both routes every 500 ms while Android Auto
+  may be stealing the route during Assistant activation.
+- Privileged routing reports exactly which mechanism succeeded or failed instead of showing a
+  misleading "fallback active" state.
+- The privileged service first tries hidden `AudioSystem.setForceUse()` from the Shizuku shell
+  process, then falls back to `cmd audio set-force-use` only when the ROM exposes that command.
+- Added policy verification from `dumpsys audio` / `dumpsys media.audio_policy`.
+
+### Recommended test sequence
+
+1. Start Shizuku and grant BTMicFix permission.
+2. Connect Android Auto to the W622.
+3. Connect the Cardo to the phone.
+4. In BTMicFix select/route to the Cardo (BT SCO).
+5. Confirm the Shizuku card says **servizio privilegiato connesso**.
+6. Tap **LOCK ROUTING PER 30 SECONDI**.
+7. During those 30 seconds invoke Gemini/Assistant from the Cardo and speak into the Cardo mic.
+8. Read the diagnostic result shown in BTMicFix. If it says the ROM blocks both reflection and
+   `cmd audio set-force-use`, the limitation is below the normal app/Shizuku routing layer.
+
+This is experimental and intentionally does not use root.
