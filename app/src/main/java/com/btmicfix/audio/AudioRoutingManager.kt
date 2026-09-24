@@ -1,26 +1,33 @@
 package com.btmicfix.audio
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
+import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import android.os.SystemClock
+import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import com.btmicfix.BuildConfig
 import com.btmicfix.util.Logger
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import kotlin.math.sqrt
 
 /**
  * Core audio routing manager.
  *
- * This is the primary mechanism for fixing Bluetooth mic routing.
- * It uses [AudioManager.setCommunicationDevice] (API 31+) to force the system
- * to use a Bluetooth device for communication audio input.
- *
- * The key insight: AI voice apps fail to trigger the A2DP → SCO/HFP profile
- * switch that enables the Bluetooth microphone. By calling setCommunicationDevice()
- * before the AI app starts recording, we force the system to make the switch.
+ * Primary routing uses AudioManager.setCommunicationDevice() (API 31+).
+ * The diagnostic microphone test additionally opens an AudioRecord using
+ * VOICE_COMMUNICATION and explicitly requests the Bluetooth SCO input, so we can
+ * distinguish "Android says SCO is selected" from "audio is really arriving from SCO".
  */
 class AudioRoutingManager(private val context: Context) {
 
@@ -34,9 +41,11 @@ class AudioRoutingManager(private val context: Context) {
     private val _availableDevices = MutableStateFlow<List<BluetoothAudioDevice>>(emptyList())
     val availableDevices: StateFlow<List<BluetoothAudioDevice>> = _availableDevices.asStateFlow()
 
+    private val _lastMicTestResult = MutableStateFlow<MicTestResult?>(null)
+    val lastMicTestResult: StateFlow<MicTestResult?> = _lastMicTestResult.asStateFlow()
+
     private var currentRoutedDevice: AudioDeviceInfo? = null
 
-    // Listen for device additions/removals
     private val deviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
             Logger.i("Audio devices added: ${addedDevices.map { deviceTypeToString(it.type) }}")
@@ -45,7 +54,6 @@ class AudioRoutingManager(private val context: Context) {
 
         override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
             Logger.i("Audio devices removed: ${removedDevices.map { deviceTypeToString(it.type) }}")
-            // If our routed device was removed, clear routing
             currentRoutedDevice?.let { routed ->
                 if (removedDevices.any { it.id == routed.id }) {
                     Logger.w("Routed device was removed, clearing routing")
@@ -56,9 +64,6 @@ class AudioRoutingManager(private val context: Context) {
         }
     }
 
-    /**
-     * Sealed class representing the current routing state.
-     */
     sealed class RoutingState {
         data object Idle : RoutingState()
         data class Routing(val deviceName: String) : RoutingState()
@@ -66,9 +71,6 @@ class AudioRoutingManager(private val context: Context) {
         data class Failed(val reason: String) : RoutingState()
     }
 
-    /**
-     * Represents a Bluetooth audio device that can be used for communication.
-     */
     data class BluetoothAudioDevice(
         val deviceInfo: AudioDeviceInfo,
         val name: String,
@@ -76,33 +78,48 @@ class AudioRoutingManager(private val context: Context) {
         val typeLabel: String,
     )
 
-    /**
-     * Start monitoring for audio device changes.
-     * Call this when the app starts or the service wakes up.
-     */
+    /** Result of the real microphone diagnostic test. */
+    data class MicTestResult(
+        val verdict: MicTestVerdict,
+        val requestedInput: String,
+        val actualInput: String,
+        val preferredDeviceAccepted: Boolean,
+        val communicationDevice: String,
+        val peak: Int,
+        val rms: Double,
+        val samplesRead: Long,
+        val durationMs: Long,
+        val details: String,
+    ) {
+        val summary: String
+            get() = when (verdict) {
+                MicTestVerdict.PASS -> "Cardo usato realmente come microfono"
+                MicTestVerdict.NO_AUDIO -> "Cardo selezionato, ma nessun audio ricevuto"
+                MicTestVerdict.WRONG_DEVICE -> "Android sta usando un altro microfono"
+                MicTestVerdict.PERMISSION_REQUIRED -> "Permesso microfono necessario"
+                MicTestVerdict.ERROR -> "Test microfono non riuscito"
+            }
+    }
+
+    enum class MicTestVerdict {
+        PASS,
+        NO_AUDIO,
+        WRONG_DEVICE,
+        PERMISSION_REQUIRED,
+        ERROR,
+    }
+
     fun startMonitoring() {
         Logger.i("Starting audio device monitoring")
         audioManager.registerAudioDeviceCallback(deviceCallback, null)
         refreshAvailableDevices()
     }
 
-    /**
-     * Stop monitoring for audio device changes.
-     * Call this when the app is destroyed or the service sleeps.
-     */
     fun stopMonitoring() {
         Logger.i("Stopping audio device monitoring")
         audioManager.unregisterAudioDeviceCallback(deviceCallback)
     }
 
-    /**
-     * Attempt to route communication audio to the specified Bluetooth device.
-     *
-     * This sets the device as the preferred communication device, which triggers
-     * the necessary A2DP → SCO/HFP profile switch that enables the microphone.
-     *
-     * @return The resulting [RoutingState] after the attempt.
-     */
     fun routeToBluetooth(device: AudioDeviceInfo): RoutingState {
         val deviceName = device.productName?.toString() ?: "Dispositivo Bluetooth"
         Logger.i("Attempting to route to: $deviceName (type=${deviceTypeToString(device.type)})")
@@ -110,40 +127,31 @@ class AudioRoutingManager(private val context: Context) {
         _routingState.value = RoutingState.Routing(deviceName)
 
         try {
-            // Set audio mode to communication — this is critical.
-            // It tells the system we want two-way audio, not just media playback.
             audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-
-            // This is the magic call — it forces the system to select this device
-            // for communication audio, which triggers the SCO/HFP profile switch.
             val success = audioManager.setCommunicationDevice(device)
 
             if (success) {
                 currentRoutedDevice = device
                 val state = RoutingState.Active(deviceName)
                 _routingState.value = state
-                Logger.i("✓ Routing active: $deviceName")
+                Logger.i("Routing active: $deviceName")
                 return state
             } else {
                 val state = RoutingState.Failed("setCommunicationDevice ha restituito false")
                 _routingState.value = state
-                Logger.e("✗ setCommunicationDevice failed for $deviceName")
+                Logger.e("setCommunicationDevice failed for $deviceName")
                 audioManager.mode = AudioManager.MODE_NORMAL
                 return state
             }
         } catch (e: Exception) {
             val state = RoutingState.Failed(e.message ?: "Errore sconosciuto")
             _routingState.value = state
-            Logger.e("✗ Exception during routing", e)
+            Logger.e("Exception during routing", e)
             audioManager.mode = AudioManager.MODE_NORMAL
             return state
         }
     }
 
-    /**
-     * Route to the first available Bluetooth communication device.
-     * Convenience method for background service use.
-     */
     fun routeToFirstAvailableBluetooth(): RoutingState {
         val btDevice = findFirstBluetoothCommunicationDevice()
         if (btDevice == null) {
@@ -155,9 +163,6 @@ class AudioRoutingManager(private val context: Context) {
         return routeToBluetooth(btDevice)
     }
 
-    /**
-     * Route to a specific device by matching its address from preferences.
-     */
     fun routeToDeviceByAddress(address: String): RoutingState {
         val targetDevice = getAvailableCommunicationDevices().find { deviceInfo ->
             deviceInfo.address == address
@@ -171,9 +176,6 @@ class AudioRoutingManager(private val context: Context) {
         return routeToBluetooth(targetDevice)
     }
 
-    /**
-     * Clear the communication device routing, reverting to system defaults.
-     */
     fun clearRouting() {
         Logger.i("Clearing audio routing")
         try {
@@ -187,38 +189,21 @@ class AudioRoutingManager(private val context: Context) {
         }
     }
 
-    /**
-     * Get all available communication devices (these are devices the system
-     * can use for two-way audio — specifically, devices that support SCO/HFP).
-     */
     fun getAvailableCommunicationDevices(): List<AudioDeviceInfo> {
         return audioManager.availableCommunicationDevices
     }
 
-    /**
-     * Find the first Bluetooth device in the available communication devices.
-     */
     fun findFirstBluetoothCommunicationDevice(): AudioDeviceInfo? {
         return audioManager.availableCommunicationDevices.firstOrNull { device ->
             device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-            device.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+                device.type == AudioDeviceInfo.TYPE_BLE_HEADSET
         }
     }
 
-    /**
-     * Check if the currently set communication device is a Bluetooth device.
-     */
     fun isBluetoothRouted(): Boolean {
         return currentRoutedDevice != null && _routingState.value is RoutingState.Active
     }
 
-    /**
-     * Re-assert the currently selected Bluetooth communication device without changing
-     * the user's selection. Useful when Android Auto or an OEM audio policy steals the
-     * communication route after the initial setCommunicationDevice() call.
-     *
-     * @return true when Android accepted the re-assertion.
-     */
     fun reassertCurrentRouting(): Boolean {
         val device = currentRoutedDevice ?: findFirstBluetoothCommunicationDevice() ?: return false
         return try {
@@ -239,7 +224,6 @@ class AudioRoutingManager(private val context: Context) {
         }
     }
 
-    /** Current Android communication device, useful for diagnostics. */
     fun currentCommunicationDeviceLabel(): String {
         val device = audioManager.communicationDevice
         return if (device == null) {
@@ -250,15 +234,212 @@ class AudioRoutingManager(private val context: Context) {
     }
 
     /**
-     * Refresh the list of available Bluetooth audio devices.
+     * Real-world SCO microphone test.
+     *
+     * It opens AudioRecord with VOICE_COMMUNICATION, explicitly requests the Bluetooth
+     * SCO/BLE input that matches the selected communication device, records for a few
+     * seconds, and reports AudioRecord.routedDevice plus actual PCM activity.
+     *
+     * This test is intentionally diagnostic: it does not save or expose recorded audio.
      */
+    suspend fun testBluetoothMicrophone(durationMs: Long = 6_000L): MicTestResult =
+        withContext(Dispatchers.IO) {
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
+                PackageManager.PERMISSION_GRANTED
+            ) {
+                return@withContext publishMicTest(
+                    MicTestResult(
+                        verdict = MicTestVerdict.PERMISSION_REQUIRED,
+                        requestedInput = "N/D",
+                        actualInput = "N/D",
+                        preferredDeviceAccepted = false,
+                        communicationDevice = currentCommunicationDeviceLabel(),
+                        peak = 0,
+                        rms = 0.0,
+                        samplesRead = 0,
+                        durationMs = 0,
+                        details = "PERMISSION_REQUIRED: android.permission.RECORD_AUDIO non concesso",
+                    )
+                )
+            }
+
+            val communicationDevice =
+                currentRoutedDevice ?: findFirstBluetoothCommunicationDevice()
+
+            // Establish communication mode first: on some OEM stacks the SCO input only
+            // becomes visible after the communication device has been selected.
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            communicationDevice?.let {
+                val accepted = audioManager.setCommunicationDevice(it)
+                Logger.i("Mic test initial communication device accepted=$accepted")
+            }
+            Thread.sleep(250)
+
+            val inputDevices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).toList()
+            val communicationName = communicationDevice?.productName?.toString()
+
+            val bluetoothInputs = inputDevices.filter { isBluetoothMicType(it.type) }
+            val requestedInput = bluetoothInputs.firstOrNull {
+                communicationName != null &&
+                    it.productName?.toString()?.equals(communicationName, ignoreCase = true) == true
+            } ?: bluetoothInputs.firstOrNull()
+
+            if (requestedInput == null) {
+                val inputs = inputDevices.joinToString { deviceLabel(it) }
+                return@withContext publishMicTest(
+                    MicTestResult(
+                        verdict = MicTestVerdict.WRONG_DEVICE,
+                        requestedInput = "Nessun input BT SCO/BLE disponibile",
+                        actualInput = "N/D",
+                        preferredDeviceAccepted = false,
+                        communicationDevice = currentCommunicationDeviceLabel(),
+                        peak = 0,
+                        rms = 0.0,
+                        samplesRead = 0,
+                        durationMs = 0,
+                        details = buildString {
+                            appendLine("VERDICT=WRONG_DEVICE")
+                            appendLine("Nessun AudioDeviceInfo di input Bluetooth SCO/BLE trovato")
+                            appendLine("Communication device: ${currentCommunicationDeviceLabel()}")
+                            appendLine("Input disponibili: $inputs")
+                        }.trim(),
+                    )
+                )
+            }
+
+            var recorder: AudioRecord? = null
+            try {
+                val sampleRate = 16_000
+                val channelMask = AudioFormat.CHANNEL_IN_MONO
+                val encoding = AudioFormat.ENCODING_PCM_16BIT
+                val minBuffer = AudioRecord.getMinBufferSize(sampleRate, channelMask, encoding)
+                val bufferSize = maxOf(minBuffer, sampleRate / 2 * 2, 4096)
+
+                recorder = AudioRecord.Builder()
+                    .setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(encoding)
+                            .setSampleRate(sampleRate)
+                            .setChannelMask(channelMask)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(bufferSize)
+                    .build()
+
+                if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+                    throw IllegalStateException("AudioRecord non inizializzato")
+                }
+
+                val preferredAccepted = recorder.setPreferredDevice(requestedInput)
+                recorder.startRecording()
+
+                // Give AudioPolicy a brief moment to settle before inspecting routedDevice.
+                Thread.sleep(250)
+
+                val start = SystemClock.elapsedRealtime()
+                val pcm = ShortArray(1024)
+                var peak = 0
+                var sumSquares = 0.0
+                var samplesRead = 0L
+                var lastActualDevice: AudioDeviceInfo? = recorder.routedDevice
+                var readErrors = 0
+
+                while (SystemClock.elapsedRealtime() - start < durationMs) {
+                    val read = recorder.read(pcm, 0, pcm.size, AudioRecord.READ_BLOCKING)
+                    if (read > 0) {
+                        for (i in 0 until read) {
+                            val value = kotlin.math.abs(pcm[i].toInt())
+                            if (value > peak) peak = value
+                            sumSquares += value.toDouble() * value.toDouble()
+                        }
+                        samplesRead += read
+                        recorder.routedDevice?.let { lastActualDevice = it }
+                    } else {
+                        readErrors++
+                        if (readErrors >= 3) break
+                    }
+                }
+
+                val actualInput = lastActualDevice
+                val routedToBluetooth = actualInput != null && isBluetoothMicType(actualInput.type)
+                val rms = if (samplesRead > 0) sqrt(sumSquares / samplesRead.toDouble()) else 0.0
+                // Deliberately low threshold: the user should speak clearly during the test.
+                val audioPresent = peak >= 200 && rms >= 20.0
+
+                val verdict = when {
+                    !routedToBluetooth -> MicTestVerdict.WRONG_DEVICE
+                    !audioPresent -> MicTestVerdict.NO_AUDIO
+                    else -> MicTestVerdict.PASS
+                }
+
+                val result = MicTestResult(
+                    verdict = verdict,
+                    requestedInput = deviceLabel(requestedInput),
+                    actualInput = actualInput?.let(::deviceLabel) ?: "Nessun routedDevice riportato",
+                    preferredDeviceAccepted = preferredAccepted,
+                    communicationDevice = currentCommunicationDeviceLabel(),
+                    peak = peak,
+                    rms = rms,
+                    samplesRead = samplesRead,
+                    durationMs = SystemClock.elapsedRealtime() - start,
+                    details = buildString {
+                        appendLine("VERDICT=${verdict.name}")
+                        appendLine("Requested input: ${deviceLabel(requestedInput)}")
+                        appendLine("setPreferredDevice accepted: $preferredAccepted")
+                        appendLine("Actual routed input: ${actualInput?.let(::deviceLabel) ?: "null"}")
+                        appendLine("Communication device: ${currentCommunicationDeviceLabel()}")
+                        appendLine("Peak PCM16: $peak / 32767")
+                        appendLine("RMS PCM16: ${"%.1f".format(rms)}")
+                        appendLine("Samples read: $samplesRead")
+                        appendLine("Duration: ${SystemClock.elapsedRealtime() - start} ms")
+                        appendLine("All BT inputs: ${bluetoothInputs.joinToString { deviceLabel(it) }}")
+                        appendLine("All inputs: ${inputDevices.joinToString { deviceLabel(it) }}")
+                    }.trim(),
+                )
+
+                Logger.i("Mic diagnostic result:\n${result.details}")
+                publishMicTest(result)
+            } catch (t: Throwable) {
+                Logger.e("Bluetooth microphone diagnostic failed", t)
+                publishMicTest(
+                    MicTestResult(
+                        verdict = MicTestVerdict.ERROR,
+                        requestedInput = deviceLabel(requestedInput),
+                        actualInput = recorder?.routedDevice?.let(::deviceLabel) ?: "N/D",
+                        preferredDeviceAccepted = false,
+                        communicationDevice = currentCommunicationDeviceLabel(),
+                        peak = 0,
+                        rms = 0.0,
+                        samplesRead = 0,
+                        durationMs = 0,
+                        details = "ERROR=${t.javaClass.simpleName}: ${t.message ?: "nessun messaggio"}",
+                    )
+                )
+            } finally {
+                try {
+                    recorder?.stop()
+                } catch (_: Throwable) {
+                }
+                try {
+                    recorder?.release()
+                } catch (_: Throwable) {
+                }
+            }
+        }
+
+    private fun publishMicTest(result: MicTestResult): MicTestResult {
+        _lastMicTestResult.value = result
+        return result
+    }
+
     private fun refreshAvailableDevices() {
         val commDevices = audioManager.availableCommunicationDevices
         val btDevices = commDevices
             .filter { device ->
                 device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-                device.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                device.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+                    device.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                    device.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
             }
             .map { device ->
                 BluetoothAudioDevice(
@@ -273,10 +454,17 @@ class AudioRoutingManager(private val context: Context) {
         Logger.d("Available BT devices: ${btDevices.map { "${it.name} (${it.typeLabel})" }}")
     }
 
+    private fun deviceLabel(device: AudioDeviceInfo): String =
+        "${device.productName ?: "Dispositivo"} (${deviceTypeToString(device.type)}, id=${device.id})"
+
     companion object {
-        /**
-         * Convert AudioDeviceInfo type constant to a human-readable string.
-         */
+        fun isBluetoothMicType(type: Int): Boolean = when (type) {
+            AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+            AudioDeviceInfo.TYPE_BLE_HEADSET,
+            -> true
+            else -> false
+        }
+
         fun deviceTypeToString(type: Int): String = when (type) {
             AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "BT SCO"
             AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "BT A2DP"

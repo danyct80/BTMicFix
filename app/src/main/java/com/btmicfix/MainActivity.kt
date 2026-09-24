@@ -13,6 +13,7 @@ import com.btmicfix.audio.AudioRoutingManager
 import com.btmicfix.audio.BluetoothStateReceiver
 import com.btmicfix.companion.DeviceCompanionManager
 import com.btmicfix.shizuku.ShizukuManager
+import com.btmicfix.ui.screens.DetailsScreen
 import com.btmicfix.ui.screens.HomeScreen
 import com.btmicfix.ui.screens.SetupScreen
 import com.btmicfix.ui.theme.BTMicFixTheme
@@ -72,6 +73,7 @@ class MainActivity : ComponentActivity(), BluetoothStateReceiver.BluetoothConnec
                             audioRoutingManager = audioRoutingManager,
                             shizukuManager = shizukuManager,
                             onSetupClick = { currentScreen = Screen.Setup },
+                            onDetailsClick = { currentScreen = Screen.Details },
                             modifier = Modifier.fillMaxSize(),
                         )
                     }
@@ -85,6 +87,14 @@ class MainActivity : ComponentActivity(), BluetoothStateReceiver.BluetoothConnec
                                 preferences.setupCompleted = true
                                 currentScreen = Screen.Home
                             },
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                    }
+                    Screen.Details -> {
+                        DetailsScreen(
+                            audioRoutingManager = audioRoutingManager,
+                            shizukuManager = shizukuManager,
+                            onBackClick = { currentScreen = Screen.Home },
                             modifier = Modifier.fillMaxSize(),
                         )
                     }
@@ -132,5 +142,6 @@ class MainActivity : ComponentActivity(), BluetoothStateReceiver.BluetoothConnec
     private enum class Screen {
         Home,
         Setup,
+        Details,
     }
 }

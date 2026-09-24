@@ -1,19 +1,28 @@
 package com.btmicfix.ui.screens
 
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BugReport
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import com.btmicfix.audio.AudioRoutingManager
+import com.btmicfix.audio.AudioRoutingManager.MicTestVerdict
 import com.btmicfix.audio.AudioRoutingManager.RoutingState
 import com.btmicfix.shizuku.ShizukuManager
 import com.btmicfix.shizuku.ShizukuManager.ShizukuStatus
@@ -34,6 +43,7 @@ fun HomeScreen(
     audioRoutingManager: AudioRoutingManager,
     shizukuManager: ShizukuManager,
     onSetupClick: () -> Unit,
+    onDetailsClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val routingState by audioRoutingManager.routingState.collectAsState()
@@ -41,6 +51,7 @@ fun HomeScreen(
     val shizukuStatus by shizukuManager.status.collectAsState()
     val serviceState by shizukuManager.serviceState.collectAsState()
     val lastForceResult by shizukuManager.lastForceResult.collectAsState()
+    val lastMicTestResult by audioRoutingManager.lastMicTestResult.collectAsState()
 
     Scaffold(
         modifier = modifier,
@@ -88,12 +99,14 @@ fun HomeScreen(
 
             ShizukuStatusCard(shizukuManager = shizukuManager)
 
-            AndroidAutoForceCard(
+            AndroidAutoToolsCard(
                 audioRoutingManager = audioRoutingManager,
                 shizukuManager = shizukuManager,
                 shizukuStatus = shizukuStatus,
                 serviceState = serviceState,
                 lastForceResult = lastForceResult,
+                lastMicTestResult = lastMicTestResult,
+                onDetailsClick = onDetailsClick,
             )
 
             HowItWorksCard()
@@ -102,24 +115,62 @@ fun HomeScreen(
     }
 }
 
+/**
+ * Compact Android Auto tools card.
+ * Raw diagnostics are deliberately hidden from the home screen and moved to DetailsScreen.
+ */
 @Composable
-private fun AndroidAutoForceCard(
+private fun AndroidAutoToolsCard(
     audioRoutingManager: AudioRoutingManager,
     shizukuManager: ShizukuManager,
     shizukuStatus: ShizukuStatus,
     serviceState: UserServiceState,
     lastForceResult: String?,
+    lastMicTestResult: AudioRoutingManager.MicTestResult?,
+    onDetailsClick: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
     var lockJob by remember { mutableStateOf<Job?>(null) }
     var lockActive by remember { mutableStateOf(false) }
-    var localMessage by remember { mutableStateOf<String?>(null) }
+    var micTestRunning by remember { mutableStateOf(false) }
+
+    val ready = shizukuStatus == ShizukuStatus.READY && serviceState == UserServiceState.READY
+
+    fun launchMicTest() {
+        if (micTestRunning) return
+        micTestRunning = true
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    audioRoutingManager.reassertCurrentRouting()
+                    if (ready) shizukuManager.forceBluetoothSco()
+                    audioRoutingManager.testBluetoothMicrophone()
+                }
+            } finally {
+                micTestRunning = false
+            }
+        }
+    }
+
+    val micPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) launchMicTest()
+    }
 
     DisposableEffect(Unit) {
         onDispose { lockJob?.cancel() }
     }
 
-    val ready = shizukuStatus == ShizukuStatus.READY && serviceState == UserServiceState.READY
+    val forceSummary = when {
+        lastForceResult.isNullOrBlank() -> null
+        lastForceResult.contains("RESULT=FAILED", ignoreCase = true) ||
+            lastForceResult.contains("ERRORE", ignoreCase = true) -> "Forzatura Shizuku non riuscita"
+        lastForceResult.contains("AudioSystem.setForceUse(0,3) -> 0") &&
+            lastForceResult.contains("AudioSystem.setForceUse(2,3) -> 0") -> "Policy SCO COMMUNICATION + RECORD forzate"
+        else -> "Forzatura Shizuku eseguita: controlla Dettagli"
+    }
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -135,8 +186,9 @@ private fun AndroidAutoForceCard(
                 style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.onSurface,
             )
+
             Text(
-                "Fallback sperimentale: seleziona il Cardo con l'API Android e forza COMMUNICATION + RECORD su Bluetooth SCO tramite Shizuku.",
+                audioRoutingManager.currentCommunicationDeviceLabel(),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -145,7 +197,7 @@ private fun AndroidAutoForceCard(
                 enabled = ready,
                 onClick = {
                     scope.launch {
-                        localMessage = withContext(Dispatchers.IO) {
+                        withContext(Dispatchers.IO) {
                             audioRoutingManager.reassertCurrentRouting()
                             shizukuManager.forceBluetoothSco()
                         }
@@ -154,7 +206,7 @@ private fun AndroidAutoForceCard(
                 modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = Purple40),
             ) {
-                Text("FORZA CARDO ORA (SHIZUKU)")
+                Text("Forza Cardo ora")
             }
 
             OutlinedButton(
@@ -169,7 +221,7 @@ private fun AndroidAutoForceCard(
                         lockActive = true
                         lockJob = scope.launch(Dispatchers.IO) {
                             try {
-                                repeat(60) { // 30 seconds at 500 ms
+                                repeat(60) {
                                     audioRoutingManager.reassertCurrentRouting()
                                     shizukuManager.forceBluetoothSco()
                                     delay(500)
@@ -182,27 +234,68 @@ private fun AndroidAutoForceCard(
                 },
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text(if (lockActive) "FERMA LOCK" else "LOCK ROUTING PER 30 SECONDI")
+                Text(if (lockActive) "Ferma lock" else "Lock routing per 30 secondi")
             }
 
-            Text(
-                "Communication device: ${audioRoutingManager.currentCommunicationDeviceLabel()}",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            FilledTonalButton(
+                enabled = !micTestRunning,
+                onClick = {
+                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                        PackageManager.PERMISSION_GRANTED
+                    ) {
+                        launchMicTest()
+                    } else {
+                        micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                if (micTestRunning) {
+                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Parla nel Cardo…")
+                } else {
+                    Icon(Icons.Default.Mic, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Test microfono Cardo (6 s)")
+                }
+            }
 
-            val message = localMessage ?: lastForceResult
-            if (!message.isNullOrBlank()) {
+            forceSummary?.let {
                 Text(
-                    message,
+                    it,
                     style = MaterialTheme.typography.bodySmall,
-                    color = if (message.contains("FAILED") || message.contains("ERRORE")) StatusFailed else StatusActive,
+                    color = if (it.contains("non riuscita")) StatusFailed else StatusActive,
                 )
+            }
+
+            lastMicTestResult?.let { result ->
+                Text(
+                    result.summary,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = when (result.verdict) {
+                        MicTestVerdict.PASS -> StatusActive
+                        MicTestVerdict.NO_AUDIO -> StatusRouting
+                        MicTestVerdict.WRONG_DEVICE,
+                        MicTestVerdict.ERROR,
+                        MicTestVerdict.PERMISSION_REQUIRED,
+                        -> StatusFailed
+                    },
+                )
+            }
+
+            OutlinedButton(
+                onClick = onDetailsClick,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Icon(Icons.Default.BugReport, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Dettagli tecnici")
             }
 
             if (!ready) {
                 Text(
-                    "Shizuku deve risultare READY e il servizio privilegiato deve essere connesso.",
+                    "Per le forzature avanzate Shizuku deve essere pronto e autorizzato.",
                     style = MaterialTheme.typography.bodySmall,
                     color = StatusRouting,
                 )
@@ -278,7 +371,7 @@ private fun HowItWorksCard() {
                 "Il routing standard usa setCommunicationDevice per selezionare il Cardo come dispositivo di comunicazione.",
                 "Il fallback Android Auto usa Shizuku per tentare di forzare le policy COMMUNICATION e RECORD su BT SCO.",
                 "Il pulsante LOCK ripete entrambe le forzature per 30 secondi, utile se Android Auto sovrascrive il routing quando parte Gemini.",
-                "Il risultato Shizuku indica esplicitamente se il ROM ha accettato o rifiutato la forzatura privilegiata.",
+                "Il test microfono apre un ingresso VOICE_COMMUNICATION e verifica quale microfono Android usa davvero.",
             )
             steps.forEachIndexed { index, step ->
                 Row {
