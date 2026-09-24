@@ -34,7 +34,7 @@ fun DetailsScreen(
     val shizukuStatus by shizukuManager.status.collectAsState()
     val serviceState by shizukuManager.serviceState.collectAsState()
     val lastForceResult by shizukuManager.lastForceResult.collectAsState()
-    val lastMicTestResult by audioRoutingManager.lastMicTestResult.collectAsState()
+    val micTestResults by audioRoutingManager.micTestResults.collectAsState()
     val scope = rememberCoroutineScope()
     var audioDump by remember { mutableStateOf<String?>(null) }
     var dumpLoading by remember { mutableStateOf(false) }
@@ -78,10 +78,12 @@ fun DetailsScreen(
                 text = lastForceResult ?: "Nessuna forzatura eseguita in questa sessione.",
             )
 
-            DetailCodeCard(
-                title = "Ultimo test microfono",
-                text = lastMicTestResult?.details ?: "Nessun test microfono eseguito in questa sessione.",
-            )
+            AudioRoutingManager.MicTestSource.entries.forEach { source ->
+                DetailCodeCard(
+                    title = "Test ${source.label}",
+                    text = micTestResults[source]?.details ?: "Non eseguito in questa sessione.",
+                )
+            }
 
             OutlinedButton(
                 onClick = {

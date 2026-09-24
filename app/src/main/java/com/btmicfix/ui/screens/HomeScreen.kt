@@ -22,6 +22,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.btmicfix.audio.AudioRoutingManager
+import com.btmicfix.audio.AudioRoutingManager.MicTestSource
 import com.btmicfix.audio.AudioRoutingManager.MicTestVerdict
 import com.btmicfix.audio.AudioRoutingManager.RoutingState
 import com.btmicfix.shizuku.ShizukuManager
@@ -51,7 +52,7 @@ fun HomeScreen(
     val shizukuStatus by shizukuManager.status.collectAsState()
     val serviceState by shizukuManager.serviceState.collectAsState()
     val lastForceResult by shizukuManager.lastForceResult.collectAsState()
-    val lastMicTestResult by audioRoutingManager.lastMicTestResult.collectAsState()
+    val micTestResults by audioRoutingManager.micTestResults.collectAsState()
 
     Scaffold(
         modifier = modifier,
@@ -105,7 +106,7 @@ fun HomeScreen(
                 shizukuStatus = shizukuStatus,
                 serviceState = serviceState,
                 lastForceResult = lastForceResult,
-                lastMicTestResult = lastMicTestResult,
+                micTestResults = micTestResults,
                 onDetailsClick = onDetailsClick,
             )
 
@@ -126,29 +127,30 @@ private fun AndroidAutoToolsCard(
     shizukuStatus: ShizukuStatus,
     serviceState: UserServiceState,
     lastForceResult: String?,
-    lastMicTestResult: AudioRoutingManager.MicTestResult?,
+    micTestResults: Map<MicTestSource, AudioRoutingManager.MicTestResult>,
     onDetailsClick: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     var lockJob by remember { mutableStateOf<Job?>(null) }
     var lockActive by remember { mutableStateOf(false) }
-    var micTestRunning by remember { mutableStateOf(false) }
+    var runningMicTest by remember { mutableStateOf<MicTestSource?>(null) }
+    var pendingMicTest by remember { mutableStateOf<MicTestSource?>(null) }
 
     val ready = shizukuStatus == ShizukuStatus.READY && serviceState == UserServiceState.READY
 
-    fun launchMicTest() {
-        if (micTestRunning) return
-        micTestRunning = true
+    fun launchMicTest(source: MicTestSource) {
+        if (runningMicTest != null) return
+        runningMicTest = source
         scope.launch {
             try {
                 withContext(Dispatchers.IO) {
                     audioRoutingManager.reassertCurrentRouting()
                     if (ready) shizukuManager.forceBluetoothSco()
-                    audioRoutingManager.testBluetoothMicrophone()
+                    audioRoutingManager.testBluetoothMicrophone(source = source)
                 }
             } finally {
-                micTestRunning = false
+                runningMicTest = null
             }
         }
     }
@@ -156,7 +158,20 @@ private fun AndroidAutoToolsCard(
     val micPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
     ) { granted ->
-        if (granted) launchMicTest()
+        val source = pendingMicTest
+        pendingMicTest = null
+        if (granted && source != null) launchMicTest(source)
+    }
+
+    fun requestMicTest(source: MicTestSource) {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            launchMicTest(source)
+        } else {
+            pendingMicTest = source
+            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
     }
 
     DisposableEffect(Unit) {
@@ -237,50 +252,41 @@ private fun AndroidAutoToolsCard(
                 Text(if (lockActive) "Ferma lock" else "Lock routing per 30 secondi")
             }
 
-            FilledTonalButton(
-                enabled = !micTestRunning,
-                onClick = {
-                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
-                        PackageManager.PERMISSION_GRANTED
-                    ) {
-                        launchMicTest()
-                    } else {
-                        micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                    }
-                },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                if (micTestRunning) {
-                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("Parla nel Cardo…")
-                } else {
-                    Icon(Icons.Default.Mic, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("Test microfono Cardo (6 s)")
-                }
-            }
+            Text(
+                "Diagnostica sorgente microfono",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            MicSourceTestRow(
+                source = MicTestSource.VOICE_COMMUNICATION,
+                result = micTestResults[MicTestSource.VOICE_COMMUNICATION],
+                running = runningMicTest == MicTestSource.VOICE_COMMUNICATION,
+                enabled = runningMicTest == null,
+                onTest = { requestMicTest(MicTestSource.VOICE_COMMUNICATION) },
+            )
+
+            MicSourceTestRow(
+                source = MicTestSource.VOICE_RECOGNITION,
+                result = micTestResults[MicTestSource.VOICE_RECOGNITION],
+                running = runningMicTest == MicTestSource.VOICE_RECOGNITION,
+                enabled = runningMicTest == null,
+                onTest = { requestMicTest(MicTestSource.VOICE_RECOGNITION) },
+            )
+
+            MicSourceTestRow(
+                source = MicTestSource.MIC,
+                result = micTestResults[MicTestSource.MIC],
+                running = runningMicTest == MicTestSource.MIC,
+                enabled = runningMicTest == null,
+                onTest = { requestMicTest(MicTestSource.MIC) },
+            )
 
             forceSummary?.let {
                 Text(
                     it,
                     style = MaterialTheme.typography.bodySmall,
                     color = if (it.contains("non riuscita")) StatusFailed else StatusActive,
-                )
-            }
-
-            lastMicTestResult?.let { result ->
-                Text(
-                    result.summary,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = when (result.verdict) {
-                        MicTestVerdict.PASS -> StatusActive
-                        MicTestVerdict.NO_AUDIO -> StatusRouting
-                        MicTestVerdict.WRONG_DEVICE,
-                        MicTestVerdict.ERROR,
-                        MicTestVerdict.PERMISSION_REQUIRED,
-                        -> StatusFailed
-                    },
                 )
             }
 
@@ -299,6 +305,66 @@ private fun AndroidAutoToolsCard(
                     style = MaterialTheme.typography.bodySmall,
                     color = StatusRouting,
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun MicSourceTestRow(
+    source: MicTestSource,
+    result: AudioRoutingManager.MicTestResult?,
+    running: Boolean,
+    enabled: Boolean,
+    onTest: () -> Unit,
+) {
+    val resultColor = when (result?.verdict) {
+        MicTestVerdict.PASS -> StatusActive
+        MicTestVerdict.NO_AUDIO -> StatusRouting
+        MicTestVerdict.WRONG_DEVICE,
+        MicTestVerdict.ERROR,
+        MicTestVerdict.PERMISSION_REQUIRED,
+        -> StatusFailed
+        null -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                Text(
+                    source.label,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Text(
+                    result?.summary ?: "Non testato",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = resultColor,
+                )
+            }
+
+            FilledTonalButton(
+                enabled = enabled,
+                onClick = onTest,
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+            ) {
+                if (running) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                } else {
+                    Icon(Icons.Default.Mic, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("TEST")
+                }
             }
         }
     }
@@ -371,7 +437,7 @@ private fun HowItWorksCard() {
                 "Il routing standard usa setCommunicationDevice per selezionare il Cardo come dispositivo di comunicazione.",
                 "Il fallback Android Auto usa Shizuku per tentare di forzare le policy COMMUNICATION e RECORD su BT SCO.",
                 "Il pulsante LOCK ripete entrambe le forzature per 30 secondi, utile se Android Auto sovrascrive il routing quando parte Gemini.",
-                "Il test microfono apre un ingresso VOICE_COMMUNICATION e verifica quale microfono Android usa davvero.",
+                "I tre test microfono provano VOICE_COMMUNICATION, VOICE_RECOGNITION e MIC e verificano quale ingresso Android usa davvero.",
             )
             steps.forEachIndexed { index, step ->
                 Row {

@@ -24,3 +24,13 @@ privileged UserService and exposes a real force-SCO action for COMMUNICATION + R
 - Moved raw green Shizuku/policy output to a dedicated **Dettagli tecnici** screen.
 - Home screen keeps compact Android Auto controls plus a short result summary.
 - Added optional full `dumpsys audio` / `media.audio_policy` capture in Details.
+
+## 0.4.0-aa-multisource
+- Replaced the single microphone diagnostic with three independent tests:
+  - `VOICE_COMMUNICATION`
+  - `VOICE_RECOGNITION`
+  - `MIC`
+- Each source now has its own TEST button and compact result on the home screen.
+- Results are stored independently so all three can be compared side by side.
+- Technical details screen now keeps a separate diagnostic block for each audio source.
+- Existing Shizuku force-SCO and 30-second lock behavior are unchanged.

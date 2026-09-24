@@ -138,3 +138,7 @@ This fork adds an explicit privileged fallback for the motorcycle Android Auto c
    `cmd audio set-force-use`, the limitation is below the normal app/Shizuku routing layer.
 
 This is experimental and intentionally does not use root.
+
+
+### Multi-source microphone diagnostics
+The W622/Android Auto diagnostic fork can test the Bluetooth microphone independently with `VOICE_COMMUNICATION`, `VOICE_RECOGNITION`, and `MIC`. Each test reports the requested Bluetooth input, the actual `AudioRecord.routedDevice`, and PCM activity without saving audio.

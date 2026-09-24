@@ -44,6 +44,9 @@ class AudioRoutingManager(private val context: Context) {
     private val _lastMicTestResult = MutableStateFlow<MicTestResult?>(null)
     val lastMicTestResult: StateFlow<MicTestResult?> = _lastMicTestResult.asStateFlow()
 
+    private val _micTestResults = MutableStateFlow<Map<MicTestSource, MicTestResult>>(emptyMap())
+    val micTestResults: StateFlow<Map<MicTestSource, MicTestResult>> = _micTestResults.asStateFlow()
+
     private var currentRoutedDevice: AudioDeviceInfo? = null
 
     private val deviceCallback = object : AudioDeviceCallback() {
@@ -78,8 +81,15 @@ class AudioRoutingManager(private val context: Context) {
         val typeLabel: String,
     )
 
-    /** Result of the real microphone diagnostic test. */
+    enum class MicTestSource(val audioSource: Int, val label: String) {
+        VOICE_COMMUNICATION(MediaRecorder.AudioSource.VOICE_COMMUNICATION, "VOICE_COMMUNICATION"),
+        VOICE_RECOGNITION(MediaRecorder.AudioSource.VOICE_RECOGNITION, "VOICE_RECOGNITION"),
+        MIC(MediaRecorder.AudioSource.MIC, "MIC"),
+    }
+
+    /** Result of one real microphone diagnostic test. */
     data class MicTestResult(
+        val source: MicTestSource,
         val verdict: MicTestVerdict,
         val requestedInput: String,
         val actualInput: String,
@@ -242,13 +252,16 @@ class AudioRoutingManager(private val context: Context) {
      *
      * This test is intentionally diagnostic: it does not save or expose recorded audio.
      */
-    suspend fun testBluetoothMicrophone(durationMs: Long = 6_000L): MicTestResult =
-        withContext(Dispatchers.IO) {
+    suspend fun testBluetoothMicrophone(
+        source: MicTestSource = MicTestSource.VOICE_COMMUNICATION,
+        durationMs: Long = 6_000L,
+    ): MicTestResult = withContext(Dispatchers.IO) {
             if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
                 PackageManager.PERMISSION_GRANTED
             ) {
                 return@withContext publishMicTest(
                     MicTestResult(
+                        source = source,
                         verdict = MicTestVerdict.PERMISSION_REQUIRED,
                         requestedInput = "N/D",
                         actualInput = "N/D",
@@ -258,7 +271,7 @@ class AudioRoutingManager(private val context: Context) {
                         rms = 0.0,
                         samplesRead = 0,
                         durationMs = 0,
-                        details = "PERMISSION_REQUIRED: android.permission.RECORD_AUDIO non concesso",
+                        details = "SOURCE=${source.label} (${source.audioSource})\nPERMISSION_REQUIRED: android.permission.RECORD_AUDIO non concesso",
                     )
                 )
             }
@@ -288,6 +301,7 @@ class AudioRoutingManager(private val context: Context) {
                 val inputs = inputDevices.joinToString { deviceLabel(it) }
                 return@withContext publishMicTest(
                     MicTestResult(
+                        source = source,
                         verdict = MicTestVerdict.WRONG_DEVICE,
                         requestedInput = "Nessun input BT SCO/BLE disponibile",
                         actualInput = "N/D",
@@ -298,6 +312,7 @@ class AudioRoutingManager(private val context: Context) {
                         samplesRead = 0,
                         durationMs = 0,
                         details = buildString {
+                            appendLine("SOURCE=${source.label} (${source.audioSource})")
                             appendLine("VERDICT=WRONG_DEVICE")
                             appendLine("Nessun AudioDeviceInfo di input Bluetooth SCO/BLE trovato")
                             appendLine("Communication device: ${currentCommunicationDeviceLabel()}")
@@ -316,7 +331,7 @@ class AudioRoutingManager(private val context: Context) {
                 val bufferSize = maxOf(minBuffer, sampleRate / 2 * 2, 4096)
 
                 recorder = AudioRecord.Builder()
-                    .setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
+                    .setAudioSource(source.audioSource)
                     .setAudioFormat(
                         AudioFormat.Builder()
                             .setEncoding(encoding)
@@ -374,6 +389,7 @@ class AudioRoutingManager(private val context: Context) {
                 }
 
                 val result = MicTestResult(
+                    source = source,
                     verdict = verdict,
                     requestedInput = deviceLabel(requestedInput),
                     actualInput = actualInput?.let(::deviceLabel) ?: "Nessun routedDevice riportato",
@@ -384,6 +400,7 @@ class AudioRoutingManager(private val context: Context) {
                     samplesRead = samplesRead,
                     durationMs = SystemClock.elapsedRealtime() - start,
                     details = buildString {
+                        appendLine("SOURCE=${source.label} (${source.audioSource})")
                         appendLine("VERDICT=${verdict.name}")
                         appendLine("Requested input: ${deviceLabel(requestedInput)}")
                         appendLine("setPreferredDevice accepted: $preferredAccepted")
@@ -404,6 +421,7 @@ class AudioRoutingManager(private val context: Context) {
                 Logger.e("Bluetooth microphone diagnostic failed", t)
                 publishMicTest(
                     MicTestResult(
+                        source = source,
                         verdict = MicTestVerdict.ERROR,
                         requestedInput = deviceLabel(requestedInput),
                         actualInput = recorder?.routedDevice?.let(::deviceLabel) ?: "N/D",
@@ -413,7 +431,10 @@ class AudioRoutingManager(private val context: Context) {
                         rms = 0.0,
                         samplesRead = 0,
                         durationMs = 0,
-                        details = "ERROR=${t.javaClass.simpleName}: ${t.message ?: "nessun messaggio"}",
+                        details = buildString {
+                            appendLine("SOURCE=${source.label} (${source.audioSource})")
+                            append("ERROR=${t.javaClass.simpleName}: ${t.message ?: "nessun messaggio"}")
+                        },
                     )
                 )
             } finally {
@@ -430,6 +451,9 @@ class AudioRoutingManager(private val context: Context) {
 
     private fun publishMicTest(result: MicTestResult): MicTestResult {
         _lastMicTestResult.value = result
+        _micTestResults.value = _micTestResults.value.toMutableMap().apply {
+            put(result.source, result)
+        }
         return result
     }
 
