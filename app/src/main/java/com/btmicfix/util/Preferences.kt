@@ -4,9 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import androidx.core.content.edit
 
-/**
- * Simple SharedPreferences wrapper for persisting user settings.
- */
+/** Simple SharedPreferences wrapper for persisting user settings. */
 class Preferences(context: Context) {
 
     private val prefs: SharedPreferences =
@@ -39,6 +37,25 @@ class Preferences(context: Context) {
     var setupCompleted: Boolean
         get() = prefs.getBoolean(KEY_SETUP_COMPLETED, false)
         set(value) = prefs.edit { putBoolean(KEY_SETUP_COMPLETED, value) }
+
+    fun hasPreferredDevice(): Boolean =
+        !pairedDeviceAddress.isNullOrBlank() || !pairedDeviceName.isNullOrBlank()
+
+    fun isPreferredDevice(address: String?, name: String?): Boolean {
+        val preferredAddress = pairedDeviceAddress
+        val preferredName = pairedDeviceName
+
+        // MAC address is authoritative when available. Do not fall back to the name on
+        // an address mismatch, otherwise duplicate devices with the same display name
+        // could all be treated as priority.
+        if (!preferredAddress.isNullOrBlank()) {
+            return !address.isNullOrBlank() && preferredAddress.equals(address, ignoreCase = true)
+        }
+
+        return !preferredName.isNullOrBlank() &&
+            !name.isNullOrBlank() &&
+            preferredName.equals(name, ignoreCase = true)
+    }
 
     fun clearPairedDevice() {
         prefs.edit {

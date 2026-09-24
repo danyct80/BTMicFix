@@ -47,6 +47,9 @@ class AudioRoutingManager(private val context: Context) {
     private val _micTestResults = MutableStateFlow<Map<MicTestSource, MicTestResult>>(emptyMap())
     val micTestResults: StateFlow<Map<MicTestSource, MicTestResult>> = _micTestResults.asStateFlow()
 
+    private val _micLiveLevel = MutableStateFlow<MicLiveLevel?>(null)
+    val micLiveLevel: StateFlow<MicLiveLevel?> = _micLiveLevel.asStateFlow()
+
     private var currentRoutedDevice: AudioDeviceInfo? = null
 
     private val deviceCallback = object : AudioDeviceCallback() {
@@ -87,6 +90,25 @@ class AudioRoutingManager(private val context: Context) {
         MIC(MediaRecorder.AudioSource.MIC, "MIC"),
     }
 
+    enum class MicTestPhase {
+        CALIBRATING,
+        SPEAKING,
+        FINISHED,
+    }
+
+    data class MicLiveLevel(
+        val source: MicTestSource,
+        val phase: MicTestPhase,
+        val rms: Double,
+        val peak: Int,
+        val dbfs: Double,
+        val thresholdRms: Double,
+        val thresholdPeak: Int,
+        val thresholdDbfs: Double,
+        val elapsedMs: Long,
+        val durationMs: Long,
+    )
+
     /** Result of one real microphone diagnostic test. */
     data class MicTestResult(
         val source: MicTestSource,
@@ -100,12 +122,20 @@ class AudioRoutingManager(private val context: Context) {
         val samplesRead: Long,
         val durationMs: Long,
         val details: String,
+        val baselinePeak: Int = 0,
+        val baselineRms: Double = 0.0,
+        val thresholdPeak: Int = 0,
+        val thresholdRms: Double = 0.0,
+        val routeMatchesRequested: Boolean = false,
     ) {
+        val rmsDbfs: Double get() = amplitudeToDbfs(rms)
+        val thresholdDbfs: Double get() = amplitudeToDbfs(thresholdRms)
+
         val summary: String
             get() = when (verdict) {
-                MicTestVerdict.PASS -> "Cardo usato realmente come microfono"
-                MicTestVerdict.NO_AUDIO -> "Cardo selezionato, ma nessun audio ricevuto"
-                MicTestVerdict.WRONG_DEVICE -> "Android sta usando un altro microfono"
+                MicTestVerdict.PASS -> "Route Cardo + voce sopra soglia"
+                MicTestVerdict.NO_AUDIO -> "Cardo selezionato, voce sotto soglia"
+                MicTestVerdict.WRONG_DEVICE -> "Ingresso reale diverso dal Cardo"
                 MicTestVerdict.PERMISSION_REQUIRED -> "Permesso microfono necessario"
                 MicTestVerdict.ERROR -> "Test microfono non riuscito"
             }
@@ -186,6 +216,54 @@ class AudioRoutingManager(private val context: Context) {
         return routeToBluetooth(targetDevice)
     }
 
+    /**
+     * Route only to the device explicitly selected by the user.
+     * If a priority device exists but is not connected we DO NOT fall back to another
+     * Bluetooth device (for example an Android Auto head unit).
+     */
+    fun routeToPreferredBluetooth(address: String?, name: String?): RoutingState {
+        val devices = getAvailableCommunicationDevices().filter {
+            it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+        }
+        val hasPreference = !address.isNullOrBlank() || !name.isNullOrBlank()
+
+        val target = if (!address.isNullOrBlank()) {
+            devices.firstOrNull { it.address.equals(address, ignoreCase = true) }
+        } else {
+            devices.firstOrNull {
+                !name.isNullOrBlank() &&
+                    it.productName?.toString()?.equals(name, ignoreCase = true) == true
+            }
+        }
+
+        if (target != null) return routeToBluetooth(target)
+
+        if (hasPreference) {
+            val state = RoutingState.Failed("Dispositivo prioritario non disponibile")
+            _routingState.value = state
+            Logger.w("Preferred Bluetooth device is not currently available")
+            return state
+        }
+
+        return routeToFirstAvailableBluetooth()
+    }
+
+    fun reassertPreferredRouting(address: String?, name: String?): Boolean {
+        val routed = currentRoutedDevice
+        val currentMatches = routed != null && if (!address.isNullOrBlank()) {
+            routed.address.equals(address, ignoreCase = true)
+        } else {
+            !name.isNullOrBlank() &&
+                routed.productName?.toString()?.equals(name, ignoreCase = true) == true
+        }
+
+        return if (currentMatches) {
+            reassertCurrentRouting()
+        } else {
+            routeToPreferredBluetooth(address, name) is RoutingState.Active
+        }
+    }
+
     fun clearRouting() {
         Logger.i("Clearing audio routing")
         try {
@@ -256,198 +334,270 @@ class AudioRoutingManager(private val context: Context) {
         source: MicTestSource = MicTestSource.VOICE_COMMUNICATION,
         durationMs: Long = 6_000L,
     ): MicTestResult = withContext(Dispatchers.IO) {
-            if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
-                PackageManager.PERMISSION_GRANTED
-            ) {
-                return@withContext publishMicTest(
-                    MicTestResult(
-                        source = source,
-                        verdict = MicTestVerdict.PERMISSION_REQUIRED,
-                        requestedInput = "N/D",
-                        actualInput = "N/D",
-                        preferredDeviceAccepted = false,
-                        communicationDevice = currentCommunicationDeviceLabel(),
-                        peak = 0,
-                        rms = 0.0,
-                        samplesRead = 0,
-                        durationMs = 0,
-                        details = "SOURCE=${source.label} (${source.audioSource})\nPERMISSION_REQUIRED: android.permission.RECORD_AUDIO non concesso",
-                    )
-                )
-            }
-
-            val communicationDevice =
-                currentRoutedDevice ?: findFirstBluetoothCommunicationDevice()
-
-            // Establish communication mode first: on some OEM stacks the SCO input only
-            // becomes visible after the communication device has been selected.
-            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-            communicationDevice?.let {
-                val accepted = audioManager.setCommunicationDevice(it)
-                Logger.i("Mic test initial communication device accepted=$accepted")
-            }
-            Thread.sleep(250)
-
-            val inputDevices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).toList()
-            val communicationName = communicationDevice?.productName?.toString()
-
-            val bluetoothInputs = inputDevices.filter { isBluetoothMicType(it.type) }
-            val requestedInput = bluetoothInputs.firstOrNull {
-                communicationName != null &&
-                    it.productName?.toString()?.equals(communicationName, ignoreCase = true) == true
-            } ?: bluetoothInputs.firstOrNull()
-
-            if (requestedInput == null) {
-                val inputs = inputDevices.joinToString { deviceLabel(it) }
-                return@withContext publishMicTest(
-                    MicTestResult(
-                        source = source,
-                        verdict = MicTestVerdict.WRONG_DEVICE,
-                        requestedInput = "Nessun input BT SCO/BLE disponibile",
-                        actualInput = "N/D",
-                        preferredDeviceAccepted = false,
-                        communicationDevice = currentCommunicationDeviceLabel(),
-                        peak = 0,
-                        rms = 0.0,
-                        samplesRead = 0,
-                        durationMs = 0,
-                        details = buildString {
-                            appendLine("SOURCE=${source.label} (${source.audioSource})")
-                            appendLine("VERDICT=WRONG_DEVICE")
-                            appendLine("Nessun AudioDeviceInfo di input Bluetooth SCO/BLE trovato")
-                            appendLine("Communication device: ${currentCommunicationDeviceLabel()}")
-                            appendLine("Input disponibili: $inputs")
-                        }.trim(),
-                    )
-                )
-            }
-
-            var recorder: AudioRecord? = null
-            try {
-                val sampleRate = 16_000
-                val channelMask = AudioFormat.CHANNEL_IN_MONO
-                val encoding = AudioFormat.ENCODING_PCM_16BIT
-                val minBuffer = AudioRecord.getMinBufferSize(sampleRate, channelMask, encoding)
-                val bufferSize = maxOf(minBuffer, sampleRate / 2 * 2, 4096)
-
-                recorder = AudioRecord.Builder()
-                    .setAudioSource(source.audioSource)
-                    .setAudioFormat(
-                        AudioFormat.Builder()
-                            .setEncoding(encoding)
-                            .setSampleRate(sampleRate)
-                            .setChannelMask(channelMask)
-                            .build()
-                    )
-                    .setBufferSizeInBytes(bufferSize)
-                    .build()
-
-                if (recorder.state != AudioRecord.STATE_INITIALIZED) {
-                    throw IllegalStateException("AudioRecord non inizializzato")
-                }
-
-                val preferredAccepted = recorder.setPreferredDevice(requestedInput)
-                recorder.startRecording()
-
-                // Give AudioPolicy a brief moment to settle before inspecting routedDevice.
-                Thread.sleep(250)
-
-                val start = SystemClock.elapsedRealtime()
-                val pcm = ShortArray(1024)
-                var peak = 0
-                var sumSquares = 0.0
-                var samplesRead = 0L
-                var lastActualDevice: AudioDeviceInfo? = recorder.routedDevice
-                var readErrors = 0
-
-                while (SystemClock.elapsedRealtime() - start < durationMs) {
-                    val read = recorder.read(pcm, 0, pcm.size, AudioRecord.READ_BLOCKING)
-                    if (read > 0) {
-                        for (i in 0 until read) {
-                            val value = kotlin.math.abs(pcm[i].toInt())
-                            if (value > peak) peak = value
-                            sumSquares += value.toDouble() * value.toDouble()
-                        }
-                        samplesRead += read
-                        recorder.routedDevice?.let { lastActualDevice = it }
-                    } else {
-                        readErrors++
-                        if (readErrors >= 3) break
-                    }
-                }
-
-                val actualInput = lastActualDevice
-                val routedToBluetooth = actualInput != null && isBluetoothMicType(actualInput.type)
-                val rms = if (samplesRead > 0) sqrt(sumSquares / samplesRead.toDouble()) else 0.0
-                // Deliberately low threshold: the user should speak clearly during the test.
-                val audioPresent = peak >= 200 && rms >= 20.0
-
-                val verdict = when {
-                    !routedToBluetooth -> MicTestVerdict.WRONG_DEVICE
-                    !audioPresent -> MicTestVerdict.NO_AUDIO
-                    else -> MicTestVerdict.PASS
-                }
-
-                val result = MicTestResult(
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            _micLiveLevel.value = null
+            return@withContext publishMicTest(
+                MicTestResult(
                     source = source,
-                    verdict = verdict,
-                    requestedInput = deviceLabel(requestedInput),
-                    actualInput = actualInput?.let(::deviceLabel) ?: "Nessun routedDevice riportato",
-                    preferredDeviceAccepted = preferredAccepted,
+                    verdict = MicTestVerdict.PERMISSION_REQUIRED,
+                    requestedInput = "N/D",
+                    actualInput = "N/D",
+                    preferredDeviceAccepted = false,
                     communicationDevice = currentCommunicationDeviceLabel(),
-                    peak = peak,
-                    rms = rms,
-                    samplesRead = samplesRead,
-                    durationMs = SystemClock.elapsedRealtime() - start,
+                    peak = 0,
+                    rms = 0.0,
+                    samplesRead = 0,
+                    durationMs = 0,
+                    details = "SOURCE=${source.label} (${source.audioSource})\nPERMISSION_REQUIRED: android.permission.RECORD_AUDIO non concesso",
+                )
+            )
+        }
+
+        val communicationDevice = currentRoutedDevice ?: findFirstBluetoothCommunicationDevice()
+
+        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+        communicationDevice?.let {
+            val accepted = audioManager.setCommunicationDevice(it)
+            Logger.i("Mic test initial communication device accepted=$accepted")
+        }
+        Thread.sleep(250)
+
+        val inputDevices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).toList()
+        val communicationName = communicationDevice?.productName?.toString()
+        val bluetoothInputs = inputDevices.filter { isBluetoothMicType(it.type) }
+        val requestedInput = bluetoothInputs.firstOrNull {
+            communicationName != null &&
+                it.productName?.toString()?.equals(communicationName, ignoreCase = true) == true
+        } ?: bluetoothInputs.firstOrNull()
+
+        if (requestedInput == null) {
+            val inputs = inputDevices.joinToString { deviceLabel(it) }
+            _micLiveLevel.value = null
+            return@withContext publishMicTest(
+                MicTestResult(
+                    source = source,
+                    verdict = MicTestVerdict.WRONG_DEVICE,
+                    requestedInput = "Nessun input BT SCO/BLE disponibile",
+                    actualInput = "N/D",
+                    preferredDeviceAccepted = false,
+                    communicationDevice = currentCommunicationDeviceLabel(),
+                    peak = 0,
+                    rms = 0.0,
+                    samplesRead = 0,
+                    durationMs = 0,
                     details = buildString {
                         appendLine("SOURCE=${source.label} (${source.audioSource})")
-                        appendLine("VERDICT=${verdict.name}")
-                        appendLine("Requested input: ${deviceLabel(requestedInput)}")
-                        appendLine("setPreferredDevice accepted: $preferredAccepted")
-                        appendLine("Actual routed input: ${actualInput?.let(::deviceLabel) ?: "null"}")
+                        appendLine("VERDICT=WRONG_DEVICE")
+                        appendLine("Nessun AudioDeviceInfo di input Bluetooth SCO/BLE trovato")
                         appendLine("Communication device: ${currentCommunicationDeviceLabel()}")
-                        appendLine("Peak PCM16: $peak / 32767")
-                        appendLine("RMS PCM16: ${"%.1f".format(rms)}")
-                        appendLine("Samples read: $samplesRead")
-                        appendLine("Duration: ${SystemClock.elapsedRealtime() - start} ms")
-                        appendLine("All BT inputs: ${bluetoothInputs.joinToString { deviceLabel(it) }}")
-                        appendLine("All inputs: ${inputDevices.joinToString { deviceLabel(it) }}")
+                        appendLine("Input disponibili: $inputs")
                     }.trim(),
                 )
+            )
+        }
 
-                Logger.i("Mic diagnostic result:\n${result.details}")
-                publishMicTest(result)
-            } catch (t: Throwable) {
-                Logger.e("Bluetooth microphone diagnostic failed", t)
-                publishMicTest(
-                    MicTestResult(
-                        source = source,
-                        verdict = MicTestVerdict.ERROR,
-                        requestedInput = deviceLabel(requestedInput),
-                        actualInput = recorder?.routedDevice?.let(::deviceLabel) ?: "N/D",
-                        preferredDeviceAccepted = false,
-                        communicationDevice = currentCommunicationDeviceLabel(),
-                        peak = 0,
-                        rms = 0.0,
-                        samplesRead = 0,
-                        durationMs = 0,
-                        details = buildString {
-                            appendLine("SOURCE=${source.label} (${source.audioSource})")
-                            append("ERROR=${t.javaClass.simpleName}: ${t.message ?: "nessun messaggio"}")
-                        },
-                    )
+        var recorder: AudioRecord? = null
+        try {
+            val sampleRate = 16_000
+            val channelMask = AudioFormat.CHANNEL_IN_MONO
+            val encoding = AudioFormat.ENCODING_PCM_16BIT
+            val minBuffer = AudioRecord.getMinBufferSize(sampleRate, channelMask, encoding)
+            val bufferSize = maxOf(minBuffer, sampleRate / 2 * 2, 4096)
+
+            recorder = AudioRecord.Builder()
+                .setAudioSource(source.audioSource)
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(encoding)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(channelMask)
+                        .build()
                 )
-            } finally {
-                try {
-                    recorder?.stop()
-                } catch (_: Throwable) {
+                .setBufferSizeInBytes(bufferSize)
+                .build()
+
+            if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+                throw IllegalStateException("AudioRecord non inizializzato")
+            }
+
+            val preferredAccepted = recorder.setPreferredDevice(requestedInput)
+            recorder.startRecording()
+            Thread.sleep(250)
+
+            val start = SystemClock.elapsedRealtime()
+            val calibrationMs = minOf(MIC_CALIBRATION_MS, maxOf(700L, durationMs / 3))
+            val pcm = ShortArray(1024)
+
+            var baselinePeak = 0
+            var baselineSumSquares = 0.0
+            var baselineSamples = 0L
+
+            var speechPeak = 0
+            var speechSumSquares = 0.0
+            var speechSamples = 0L
+
+            var totalSamples = 0L
+            var lastActualDevice: AudioDeviceInfo? = recorder.routedDevice
+            var readErrors = 0
+            var lastUiUpdate = 0L
+
+            while (SystemClock.elapsedRealtime() - start < durationMs) {
+                val read = recorder.read(pcm, 0, pcm.size, AudioRecord.READ_BLOCKING)
+                if (read <= 0) {
+                    readErrors++
+                    if (readErrors >= 3) break
+                    continue
                 }
-                try {
-                    recorder?.release()
-                } catch (_: Throwable) {
+
+                val now = SystemClock.elapsedRealtime()
+                val elapsed = now - start
+                val calibrating = elapsed < calibrationMs
+                var blockPeak = 0
+                var blockSumSquares = 0.0
+
+                for (i in 0 until read) {
+                    val value = kotlin.math.abs(pcm[i].toInt())
+                    if (value > blockPeak) blockPeak = value
+                    blockSumSquares += value.toDouble() * value.toDouble()
+                }
+
+                if (calibrating) {
+                    if (blockPeak > baselinePeak) baselinePeak = blockPeak
+                    baselineSumSquares += blockSumSquares
+                    baselineSamples += read
+                } else {
+                    if (blockPeak > speechPeak) speechPeak = blockPeak
+                    speechSumSquares += blockSumSquares
+                    speechSamples += read
+                }
+
+                totalSamples += read
+                recorder.routedDevice?.let { lastActualDevice = it }
+
+                if (now - lastUiUpdate >= 100L) {
+                    val blockRms = sqrt(blockSumSquares / read.toDouble())
+                    val baselineRmsNow = if (baselineSamples > 0)
+                        sqrt(baselineSumSquares / baselineSamples.toDouble()) else 0.0
+                    val thresholdRmsNow = maxOf(MIC_ABSOLUTE_MIN_RMS, baselineRmsNow * MIC_BASELINE_RMS_MULTIPLIER)
+                    val thresholdPeakNow = maxOf(MIC_ABSOLUTE_MIN_PEAK, (baselinePeak * MIC_BASELINE_PEAK_MULTIPLIER).toInt())
+                    _micLiveLevel.value = MicLiveLevel(
+                        source = source,
+                        phase = if (calibrating) MicTestPhase.CALIBRATING else MicTestPhase.SPEAKING,
+                        rms = blockRms,
+                        peak = blockPeak,
+                        dbfs = amplitudeToDbfs(blockRms),
+                        thresholdRms = thresholdRmsNow,
+                        thresholdPeak = thresholdPeakNow,
+                        thresholdDbfs = amplitudeToDbfs(thresholdRmsNow),
+                        elapsedMs = elapsed,
+                        durationMs = durationMs,
+                    )
+                    lastUiUpdate = now
                 }
             }
+
+            val actualInput = lastActualDevice
+            val baselineRms = if (baselineSamples > 0) sqrt(baselineSumSquares / baselineSamples.toDouble()) else 0.0
+            val speechRms = if (speechSamples > 0) sqrt(speechSumSquares / speechSamples.toDouble()) else 0.0
+            val thresholdRms = maxOf(MIC_ABSOLUTE_MIN_RMS, baselineRms * MIC_BASELINE_RMS_MULTIPLIER)
+            val thresholdPeak = maxOf(MIC_ABSOLUTE_MIN_PEAK, (baselinePeak * MIC_BASELINE_PEAK_MULTIPLIER).toInt())
+
+            val routeMatchesRequested = actualInput != null &&
+                isBluetoothMicType(actualInput.type) &&
+                (actualInput.id == requestedInput.id ||
+                    actualInput.productName?.toString()?.equals(
+                        requestedInput.productName?.toString(), ignoreCase = true
+                    ) == true)
+
+            val audioPresent = speechRms >= thresholdRms && speechPeak >= thresholdPeak
+            val verdict = when {
+                !routeMatchesRequested -> MicTestVerdict.WRONG_DEVICE
+                !audioPresent -> MicTestVerdict.NO_AUDIO
+                else -> MicTestVerdict.PASS
+            }
+
+            val elapsedTotal = SystemClock.elapsedRealtime() - start
+            val result = MicTestResult(
+                source = source,
+                verdict = verdict,
+                requestedInput = deviceLabel(requestedInput),
+                actualInput = actualInput?.let(::deviceLabel) ?: "Nessun routedDevice riportato",
+                preferredDeviceAccepted = preferredAccepted,
+                communicationDevice = currentCommunicationDeviceLabel(),
+                peak = speechPeak,
+                rms = speechRms,
+                samplesRead = totalSamples,
+                durationMs = elapsedTotal,
+                baselinePeak = baselinePeak,
+                baselineRms = baselineRms,
+                thresholdPeak = thresholdPeak,
+                thresholdRms = thresholdRms,
+                routeMatchesRequested = routeMatchesRequested,
+                details = buildString {
+                    appendLine("SOURCE=${source.label} (${source.audioSource})")
+                    appendLine("VERDICT=${verdict.name}")
+                    appendLine("Requested input: ${deviceLabel(requestedInput)}")
+                    appendLine("setPreferredDevice accepted: $preferredAccepted")
+                    appendLine("Actual routed input: ${actualInput?.let(::deviceLabel) ?: "null"}")
+                    appendLine("Route matches requested BT input: $routeMatchesRequested")
+                    appendLine("Communication device: ${currentCommunicationDeviceLabel()}")
+                    appendLine("Calibration: ${calibrationMs} ms (resta in silenzio)")
+                    appendLine("Baseline peak: $baselinePeak / 32767")
+                    appendLine("Baseline RMS: ${"%.1f".format(baselineRms)} (${"%.1f".format(amplitudeToDbfs(baselineRms))} dBFS)")
+                    appendLine("Voice peak: $speechPeak / 32767")
+                    appendLine("Voice RMS: ${"%.1f".format(speechRms)} (${"%.1f".format(amplitudeToDbfs(speechRms))} dBFS)")
+                    appendLine("Threshold peak: $thresholdPeak")
+                    appendLine("Threshold RMS: ${"%.1f".format(thresholdRms)} (${"%.1f".format(amplitudeToDbfs(thresholdRms))} dBFS)")
+                    appendLine("Samples read: $totalSamples")
+                    appendLine("Duration: $elapsedTotal ms")
+                    appendLine("All BT inputs: ${bluetoothInputs.joinToString { deviceLabel(it) }}")
+                    appendLine("All inputs: ${inputDevices.joinToString { deviceLabel(it) }}")
+                }.trim(),
+            )
+
+            _micLiveLevel.value = MicLiveLevel(
+                source = source,
+                phase = MicTestPhase.FINISHED,
+                rms = speechRms,
+                peak = speechPeak,
+                dbfs = amplitudeToDbfs(speechRms),
+                thresholdRms = thresholdRms,
+                thresholdPeak = thresholdPeak,
+                thresholdDbfs = amplitudeToDbfs(thresholdRms),
+                elapsedMs = elapsedTotal,
+                durationMs = durationMs,
+            )
+
+            Logger.i("Mic diagnostic result:\n${result.details}")
+            publishMicTest(result)
+        } catch (t: Throwable) {
+            Logger.e("Bluetooth microphone diagnostic failed", t)
+            _micLiveLevel.value = null
+            publishMicTest(
+                MicTestResult(
+                    source = source,
+                    verdict = MicTestVerdict.ERROR,
+                    requestedInput = deviceLabel(requestedInput),
+                    actualInput = recorder?.routedDevice?.let(::deviceLabel) ?: "N/D",
+                    preferredDeviceAccepted = false,
+                    communicationDevice = currentCommunicationDeviceLabel(),
+                    peak = 0,
+                    rms = 0.0,
+                    samplesRead = 0,
+                    durationMs = 0,
+                    details = buildString {
+                        appendLine("SOURCE=${source.label} (${source.audioSource})")
+                        append("ERROR=${t.javaClass.simpleName}: ${t.message ?: "nessun messaggio"}")
+                    },
+                )
+            )
+        } finally {
+            try { recorder?.stop() } catch (_: Throwable) {}
+            try { recorder?.release() } catch (_: Throwable) {}
         }
+    }
 
     private fun publishMicTest(result: MicTestResult): MicTestResult {
         _lastMicTestResult.value = result
@@ -482,6 +632,18 @@ class AudioRoutingManager(private val context: Context) {
         "${device.productName ?: "Dispositivo"} (${deviceTypeToString(device.type)}, id=${device.id})"
 
     companion object {
+        const val MIC_CALIBRATION_MS = 1_200L
+        const val MIC_ABSOLUTE_MIN_RMS = 250.0
+        const val MIC_ABSOLUTE_MIN_PEAK = 1_500
+        const val MIC_BASELINE_RMS_MULTIPLIER = 2.5
+        const val MIC_BASELINE_PEAK_MULTIPLIER = 2.0
+
+        fun amplitudeToDbfs(amplitude: Double): Double {
+            if (amplitude <= 0.0) return -96.0
+            val normalized = (amplitude / 32767.0).coerceIn(0.000001, 1.0)
+            return 20.0 * kotlin.math.log10(normalized)
+        }
+
         fun isBluetoothMicType(type: Int): Boolean = when (type) {
             AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
             AudioDeviceInfo.TYPE_BLE_HEADSET,

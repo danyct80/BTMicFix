@@ -22,6 +22,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.btmicfix.audio.AudioRoutingManager
+import com.btmicfix.audio.AudioRoutingManager.MicTestPhase
 import com.btmicfix.audio.AudioRoutingManager.MicTestSource
 import com.btmicfix.audio.AudioRoutingManager.MicTestVerdict
 import com.btmicfix.audio.AudioRoutingManager.RoutingState
@@ -32,6 +33,7 @@ import com.btmicfix.ui.components.DeviceSelector
 import com.btmicfix.ui.components.ShizukuStatusCard
 import com.btmicfix.ui.components.StatusCard
 import com.btmicfix.ui.theme.*
+import com.btmicfix.util.Preferences
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -43,6 +45,7 @@ import kotlinx.coroutines.withContext
 fun HomeScreen(
     audioRoutingManager: AudioRoutingManager,
     shizukuManager: ShizukuManager,
+    preferences: Preferences,
     onSetupClick: () -> Unit,
     onDetailsClick: () -> Unit,
     modifier: Modifier = Modifier,
@@ -53,6 +56,7 @@ fun HomeScreen(
     val serviceState by shizukuManager.serviceState.collectAsState()
     val lastForceResult by shizukuManager.lastForceResult.collectAsState()
     val micTestResults by audioRoutingManager.micTestResults.collectAsState()
+    val micLiveLevel by audioRoutingManager.micLiveLevel.collectAsState()
 
     Scaffold(
         modifier = modifier,
@@ -85,12 +89,22 @@ fun HomeScreen(
 
             RoutingControlButton(
                 routingState = routingState,
-                onEnableRouting = { audioRoutingManager.routeToFirstAvailableBluetooth() },
+                onEnableRouting = {
+                    audioRoutingManager.routeToPreferredBluetooth(
+                        preferences.pairedDeviceAddress,
+                        preferences.pairedDeviceName,
+                    )
+                },
                 onDisableRouting = {
                     audioRoutingManager.clearRouting()
                     shizukuManager.clearForcedBluetoothSco()
                 },
-                onRetry = { audioRoutingManager.routeToFirstAvailableBluetooth() },
+                onRetry = {
+                    audioRoutingManager.routeToPreferredBluetooth(
+                        preferences.pairedDeviceAddress,
+                        preferences.pairedDeviceName,
+                    )
+                },
             )
 
             DeviceSelector(
@@ -107,6 +121,9 @@ fun HomeScreen(
                 serviceState = serviceState,
                 lastForceResult = lastForceResult,
                 micTestResults = micTestResults,
+                micLiveLevel = micLiveLevel,
+                preferredAddress = preferences.pairedDeviceAddress,
+                preferredName = preferences.pairedDeviceName,
                 onDetailsClick = onDetailsClick,
             )
 
@@ -128,6 +145,9 @@ private fun AndroidAutoToolsCard(
     serviceState: UserServiceState,
     lastForceResult: String?,
     micTestResults: Map<MicTestSource, AudioRoutingManager.MicTestResult>,
+    micLiveLevel: AudioRoutingManager.MicLiveLevel?,
+    preferredAddress: String?,
+    preferredName: String?,
     onDetailsClick: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
@@ -145,9 +165,11 @@ private fun AndroidAutoToolsCard(
         scope.launch {
             try {
                 withContext(Dispatchers.IO) {
-                    audioRoutingManager.reassertCurrentRouting()
-                    if (ready) shizukuManager.forceBluetoothSco()
-                    audioRoutingManager.testBluetoothMicrophone(source = source)
+                    val routed = audioRoutingManager.reassertPreferredRouting(preferredAddress, preferredName)
+                    if (routed) {
+                        if (ready) shizukuManager.forceBluetoothSco()
+                        audioRoutingManager.testBluetoothMicrophone(source = source)
+                    }
                 }
             } finally {
                 runningMicTest = null
@@ -213,8 +235,9 @@ private fun AndroidAutoToolsCard(
                 onClick = {
                     scope.launch {
                         withContext(Dispatchers.IO) {
-                            audioRoutingManager.reassertCurrentRouting()
-                            shizukuManager.forceBluetoothSco()
+                            if (audioRoutingManager.reassertPreferredRouting(preferredAddress, preferredName)) {
+                                shizukuManager.forceBluetoothSco()
+                            }
                         }
                     }
                 },
@@ -237,8 +260,9 @@ private fun AndroidAutoToolsCard(
                         lockJob = scope.launch(Dispatchers.IO) {
                             try {
                                 repeat(60) {
-                                    audioRoutingManager.reassertCurrentRouting()
-                                    shizukuManager.forceBluetoothSco()
+                                    if (audioRoutingManager.reassertPreferredRouting(preferredAddress, preferredName)) {
+                                        shizukuManager.forceBluetoothSco()
+                                    }
                                     delay(500)
                                 }
                             } finally {
@@ -261,6 +285,7 @@ private fun AndroidAutoToolsCard(
             MicSourceTestRow(
                 source = MicTestSource.VOICE_COMMUNICATION,
                 result = micTestResults[MicTestSource.VOICE_COMMUNICATION],
+                liveLevel = micLiveLevel?.takeIf { it.source == MicTestSource.VOICE_COMMUNICATION },
                 running = runningMicTest == MicTestSource.VOICE_COMMUNICATION,
                 enabled = runningMicTest == null,
                 onTest = { requestMicTest(MicTestSource.VOICE_COMMUNICATION) },
@@ -269,6 +294,7 @@ private fun AndroidAutoToolsCard(
             MicSourceTestRow(
                 source = MicTestSource.VOICE_RECOGNITION,
                 result = micTestResults[MicTestSource.VOICE_RECOGNITION],
+                liveLevel = micLiveLevel?.takeIf { it.source == MicTestSource.VOICE_RECOGNITION },
                 running = runningMicTest == MicTestSource.VOICE_RECOGNITION,
                 enabled = runningMicTest == null,
                 onTest = { requestMicTest(MicTestSource.VOICE_RECOGNITION) },
@@ -277,6 +303,7 @@ private fun AndroidAutoToolsCard(
             MicSourceTestRow(
                 source = MicTestSource.MIC,
                 result = micTestResults[MicTestSource.MIC],
+                liveLevel = micLiveLevel?.takeIf { it.source == MicTestSource.MIC },
                 running = runningMicTest == MicTestSource.MIC,
                 enabled = runningMicTest == null,
                 onTest = { requestMicTest(MicTestSource.MIC) },
@@ -314,6 +341,7 @@ private fun AndroidAutoToolsCard(
 private fun MicSourceTestRow(
     source: MicTestSource,
     result: AudioRoutingManager.MicTestResult?,
+    liveLevel: AudioRoutingManager.MicLiveLevel?,
     running: Boolean,
     enabled: Boolean,
     onTest: () -> Unit,
@@ -330,7 +358,7 @@ private fun MicSourceTestRow(
 
     Column(
         modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
+        verticalArrangement = Arrangement.spacedBy(5.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -346,11 +374,25 @@ private fun MicSourceTestRow(
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onSurface,
                 )
-                Text(
-                    result?.summary ?: "Non testato",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = resultColor,
-                )
+
+                if (running && liveLevel != null) {
+                    Text(
+                        when (liveLevel.phase) {
+                            MicTestPhase.CALIBRATING -> "1/2 SILENZIO — calibrazione rumore"
+                            MicTestPhase.SPEAKING -> "2/2 PARLA NEL CARDO"
+                            MicTestPhase.FINISHED -> "Test completato"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (liveLevel.phase == MicTestPhase.SPEAKING) StatusActive else StatusRouting,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                } else {
+                    Text(
+                        result?.summary ?: "Non testato",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = resultColor,
+                    )
+                }
             }
 
             FilledTonalButton(
@@ -366,6 +408,32 @@ private fun MicSourceTestRow(
                     Text("TEST")
                 }
             }
+        }
+
+        val meterRms = if (running && liveLevel != null) liveLevel.rms else result?.rms
+        val meterThreshold = if (running && liveLevel != null) liveLevel.thresholdRms else result?.thresholdRms
+        val meterDbfs = if (running && liveLevel != null) liveLevel.dbfs else result?.rmsDbfs
+        val thresholdDbfs = if (running && liveLevel != null) liveLevel.thresholdDbfs else result?.thresholdDbfs
+
+        if (meterRms != null && meterThreshold != null && meterThreshold > 0.0 && meterDbfs != null && thresholdDbfs != null) {
+            val meterProgress = (meterRms / (meterThreshold * 2.0)).toFloat().coerceIn(0f, 1f)
+            LinearProgressIndicator(
+                progress = meterProgress,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                "Volume: ${"%.1f".format(meterDbfs)} dBFS  •  soglia min: ${"%.1f".format(thresholdDbfs)} dBFS  •  RMS ${"%.0f".format(meterRms)}/${"%.0f".format(meterThreshold)}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        if (!running && result != null) {
+            Text(
+                "Ingresso reale: ${result.actualInput}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }
@@ -437,7 +505,7 @@ private fun HowItWorksCard() {
                 "Il routing standard usa setCommunicationDevice per selezionare il Cardo come dispositivo di comunicazione.",
                 "Il fallback Android Auto usa Shizuku per tentare di forzare le policy COMMUNICATION e RECORD su BT SCO.",
                 "Il pulsante LOCK ripete entrambe le forzature per 30 secondi, utile se Android Auto sovrascrive il routing quando parte Gemini.",
-                "I tre test microfono provano VOICE_COMMUNICATION, VOICE_RECOGNITION e MIC e verificano quale ingresso Android usa davvero.",
+                "Ogni test calibra prima il rumore (resta in silenzio), poi misura la voce e mostra volume, soglia minima e ingresso realmente usato.",
             )
             steps.forEachIndexed { index, step ->
                 Row {

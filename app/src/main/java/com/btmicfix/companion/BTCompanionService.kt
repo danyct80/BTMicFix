@@ -13,6 +13,7 @@ import com.btmicfix.MainActivity
 import com.btmicfix.R
 import com.btmicfix.audio.AudioRoutingManager
 import com.btmicfix.util.Logger
+import com.btmicfix.util.Preferences
 
 /**
  * Background service that is automatically bound by the system when the
@@ -28,11 +29,13 @@ import com.btmicfix.util.Logger
 class BTCompanionService : CompanionDeviceService() {
 
     private lateinit var audioRoutingManager: AudioRoutingManager
+    private lateinit var preferences: Preferences
 
     override fun onCreate() {
         super.onCreate()
         Logger.i("BTCompanionService created")
         audioRoutingManager = AudioRoutingManager(applicationContext)
+        preferences = Preferences(applicationContext)
     }
 
     /**
@@ -43,12 +46,20 @@ class BTCompanionService : CompanionDeviceService() {
         super.onDeviceAppeared(associationInfo)
         Logger.i("🎧 Device appeared: association=${associationInfo.id}")
 
+        if (!isPriorityAssociation(associationInfo)) {
+            Logger.i("Ignoring non-priority companion association ${associationInfo.id}")
+            return
+        }
+
         // Start a foreground service to keep the routing active
         startForegroundWithNotification("Connessione…")
 
-        // Apply the audio routing fix
+        // Apply the audio routing fix ONLY to the selected priority device.
         audioRoutingManager.startMonitoring()
-        val result = audioRoutingManager.routeToFirstAvailableBluetooth()
+        val result = audioRoutingManager.routeToPreferredBluetooth(
+            preferences.pairedDeviceAddress,
+            preferences.pairedDeviceName,
+        )
 
         when (result) {
             is AudioRoutingManager.RoutingState.Active -> {
@@ -73,10 +84,22 @@ class BTCompanionService : CompanionDeviceService() {
         super.onDeviceDisappeared(associationInfo)
         Logger.i("🎧 Device disappeared: association=${associationInfo.id}")
 
+        if (!isPriorityAssociation(associationInfo)) {
+            Logger.i("Ignoring disappearance of non-priority association ${associationInfo.id}")
+            return
+        }
+
         audioRoutingManager.clearRouting()
         audioRoutingManager.stopMonitoring()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    private fun isPriorityAssociation(info: AssociationInfo): Boolean {
+        return preferences.isPreferredDevice(
+            info.deviceMacAddress?.toString(),
+            info.displayName?.toString(),
+        )
     }
 
     override fun onDestroy() {

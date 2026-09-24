@@ -83,15 +83,17 @@ fun SetupScreen(
         notificationPermissionGranted = granted
     }
 
-    // Dispositivi associati (letti dal sistema: restano corretti anche dopo un riavvio dell'app)
-    var associatedNames by remember { mutableStateOf(companionManager.getAssociatedDeviceNames()) }
+    // CDM associations. Release 0.5 supports one explicit priority device and cleanup of legacy duplicates.
+    var associatedDevices by remember { mutableStateOf(companionManager.getAssociatedDevices()) }
 
-    // CDM association launcher
+    fun refreshAssociatedDevices() {
+        associatedDevices = companionManager.getAssociatedDevices()
+    }
+
     val cdmLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult()
-    ) { result ->
-        // Dopo la scelta nella finestra di sistema, aggiorna il nome mostrato
-        associatedNames = companionManager.getAssociatedDeviceNames()
+    ) {
+        refreshAssociatedDevices()
     }
 
     Scaffold(
@@ -196,25 +198,21 @@ fun SetupScreen(
                 },
             )
 
-            // Step 4: Pair Earbuds via CDM
-            SetupStepCard(
-                stepNumber = 4,
-                title = "Associa auricolari",
-                description = if (associatedNames.isNotEmpty()) {
-                    "L'instradamento si attiverà automaticamente quando l'auricolare si connette."
-                } else {
-                    "Associa i tuoi auricolari Bluetooth per l'instradamento automatico in background."
-                },
-                detail = if (associatedNames.isNotEmpty()) {
-                    (if (associatedNames.size == 1) "Associato: " else "Associati: ") +
-                        associatedNames.joinToString(", ")
-                } else null,
-                isComplete = associatedNames.isNotEmpty(),
-                actionLabel = if (associatedNames.isNotEmpty()) "Associa un altro dispositivo" else "Associa dispositivo",
-                onAction = {
+            // Step 4: one explicit priority device. Legacy duplicates can be removed here.
+            DeviceAssociationCard(
+                devices = associatedDevices,
+                onAssociate = {
                     companionManager.startAssociation(cdmLauncher) {
-                        associatedNames = companionManager.getAssociatedDeviceNames()
+                        refreshAssociatedDevices()
                     }
+                },
+                onMakePriority = { associationId ->
+                    companionManager.makeExclusivePriority(associationId)
+                    refreshAssociatedDevices()
+                },
+                onRemove = { associationId ->
+                    companionManager.removeAssociation(associationId)
+                    refreshAssociatedDevices()
                 },
             )
 
@@ -240,12 +238,122 @@ fun SetupScreen(
                     if (routingState is AudioRoutingManager.RoutingState.Active) {
                         audioRoutingManager.clearRouting()
                     } else {
-                        audioRoutingManager.routeToFirstAvailableBluetooth()
+                        audioRoutingManager.routeToPreferredBluetooth(
+                            preferences.pairedDeviceAddress,
+                            preferences.pairedDeviceName,
+                        )
                     }
                 },
             )
 
             Spacer(modifier = Modifier.height(24.dp))
+        }
+    }
+}
+
+@Composable
+private fun DeviceAssociationCard(
+    devices: List<DeviceCompanionManager.AssociatedDevice>,
+    onAssociate: () -> Unit,
+    onMakePriority: (Int) -> Unit,
+    onRemove: (Int) -> Unit,
+) {
+    val priority = devices.firstOrNull { it.isPriority }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = if (priority != null) SurfaceCardHigh else SurfaceCard,
+        ),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalAlignment = Alignment.Top,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(32.dp)
+                    .clip(CircleShape)
+                    .background(if (priority != null) StatusActive.copy(alpha = 0.2f) else Purple40.copy(alpha = 0.2f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (priority != null) {
+                    Icon(Icons.Default.Check, contentDescription = null, tint = StatusActive, modifier = Modifier.size(18.dp))
+                } else {
+                    Text("4", color = Purple40, fontWeight = FontWeight.Bold)
+                }
+            }
+
+            Spacer(modifier = Modifier.width(12.dp))
+
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Dispositivo prioritario", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "BTMicFix instraderà il microfono solo verso questo dispositivo. Un nuovo dispositivo prioritario sostituisce automaticamente il precedente.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+
+                if (devices.isEmpty()) {
+                    Text("Nessun dispositivo associato", style = MaterialTheme.typography.bodyMedium)
+                    Button(onClick = onAssociate, colors = ButtonDefaults.buttonColors(containerColor = Purple40)) {
+                        Text("Associa dispositivo")
+                    }
+                } else if (devices.size == 1 && priority != null) {
+                    Text(
+                        "Prioritario: ${priority.name}",
+                        color = StatusActive,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = onAssociate,
+                            colors = ButtonDefaults.buttonColors(containerColor = Purple40),
+                        ) { Text("Cambia") }
+                        OutlinedButton(onClick = { onRemove(priority.associationId) }) {
+                            Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Rimuovi")
+                        }
+                    }
+                } else {
+                    Text(
+                        "Trovate ${devices.size} associazioni precedenti. Scegli quella da mantenere: le altre verranno eliminate dall'app.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = StatusRouting,
+                    )
+
+                    devices.forEach { device ->
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(device.name, fontWeight = FontWeight.SemiBold)
+                                    if (device.isPriority) {
+                                        Text("PRIORITARIO", color = StatusActive, style = MaterialTheme.typography.labelSmall)
+                                    }
+                                }
+                                if (!device.isPriority || devices.size > 1) {
+                                    TextButton(onClick = { onMakePriority(device.associationId) }) { Text("Usa") }
+                                }
+                                IconButton(onClick = { onRemove(device.associationId) }) {
+                                    Icon(Icons.Default.Delete, contentDescription = "Rimuovi ${device.name}")
+                                }
+                            }
+                        }
+                    }
+
+                    OutlinedButton(onClick = onAssociate) { Text("Associa nuovo") }
+                }
+            }
         }
     }
 }

@@ -72,6 +72,7 @@ class MainActivity : ComponentActivity(), BluetoothStateReceiver.BluetoothConnec
                         HomeScreen(
                             audioRoutingManager = audioRoutingManager,
                             shizukuManager = shizukuManager,
+                            preferences = preferences,
                             onSetupClick = { currentScreen = Screen.Setup },
                             onDetailsClick = { currentScreen = Screen.Details },
                             modifier = Modifier.fillMaxSize(),
@@ -125,15 +126,26 @@ class MainActivity : ComponentActivity(), BluetoothStateReceiver.BluetoothConnec
     // -- BluetoothConnectionListener --
 
     override fun onBluetoothDeviceConnected(device: BluetoothDevice) {
-        if (preferences.autoRouteEnabled) {
-            Logger.i("Auto-routing triggered by BT connect")
-            audioRoutingManager.routeToFirstAvailableBluetooth()
+        val deviceName = try { device.name } catch (_: SecurityException) { null }
+        if (preferences.autoRouteEnabled && preferences.isPreferredDevice(device.address, deviceName)) {
+            Logger.i("Auto-routing triggered by PRIORITY BT device connect")
+            audioRoutingManager.routeToPreferredBluetooth(
+                preferences.pairedDeviceAddress,
+                preferences.pairedDeviceName,
+            )
+        } else {
+            Logger.d("Ignoring non-priority BT connection: ${deviceName ?: "unknown"}")
         }
     }
 
     override fun onBluetoothDeviceDisconnected(device: BluetoothDevice) {
-        Logger.i("BT device disconnected, clearing routing")
-        audioRoutingManager.clearRouting()
+        val deviceName = try { device.name } catch (_: SecurityException) { null }
+        if (preferences.isPreferredDevice(device.address, deviceName)) {
+            Logger.i("Priority BT device disconnected, clearing routing")
+            audioRoutingManager.clearRouting()
+        } else {
+            Logger.d("Ignoring non-priority BT disconnect: ${deviceName ?: "unknown"}")
+        }
     }
 
     /**

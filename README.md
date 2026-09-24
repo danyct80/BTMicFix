@@ -141,4 +141,7 @@ This is experimental and intentionally does not use root.
 
 
 ### Multi-source microphone diagnostics
-The W622/Android Auto diagnostic fork can test the Bluetooth microphone independently with `VOICE_COMMUNICATION`, `VOICE_RECOGNITION`, and `MIC`. Each test reports the requested Bluetooth input, the actual `AudioRecord.routedDevice`, and PCM activity without saving audio.
+The W622/Android Auto diagnostic fork can test the Bluetooth microphone independently with `VOICE_COMMUNICATION`, `VOICE_RECOGNITION`, and `MIC`. Each test first calibrates background noise for about 1.2 seconds, then measures speech. The home screen shows a live level meter, dBFS/RMS volume and the calculated minimum threshold. PASS requires both a matching Bluetooth routed input and voice above threshold. Audio is analyzed in memory only and is never saved.
+
+### Priority companion device
+Only one companion device is treated as the automatic microphone target. Selecting a new priority device replaces previous app associations. Legacy duplicate associations can be removed individually from Setup. Automatic routing and background callbacks ignore non-priority devices such as an Android Auto head unit.
