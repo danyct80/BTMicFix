@@ -158,6 +158,9 @@ private fun AndroidAutoToolsCard(
     var pendingMicTest by remember { mutableStateOf<MicTestSource?>(null) }
 
     val ready = shizukuStatus == ShizukuStatus.READY && serviceState == UserServiceState.READY
+    val targetDeviceName = preferredName?.takeIf { it.isNotBlank() }
+        ?: audioRoutingManager.currentBluetoothCommunicationDeviceName()
+        ?: "dispositivo Bluetooth"
 
     fun launchMicTest(source: MicTestSource) {
         if (runningMicTest != null) return
@@ -246,7 +249,7 @@ private fun AndroidAutoToolsCard(
                 modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = Purple40),
             ) {
-                Text("Forza Cardo ora")
+                Text("Forza $targetDeviceName ora")
             }
 
             OutlinedButton(
@@ -286,6 +289,7 @@ private fun AndroidAutoToolsCard(
 
             MicSourceTestRow(
                 source = MicTestSource.VOICE_COMMUNICATION,
+                targetDeviceName = targetDeviceName,
                 result = micTestResults[MicTestSource.VOICE_COMMUNICATION],
                 liveLevel = micLiveLevel?.takeIf { it.source == MicTestSource.VOICE_COMMUNICATION },
                 running = runningMicTest == MicTestSource.VOICE_COMMUNICATION,
@@ -295,6 +299,7 @@ private fun AndroidAutoToolsCard(
 
             MicSourceTestRow(
                 source = MicTestSource.VOICE_RECOGNITION,
+                targetDeviceName = targetDeviceName,
                 result = micTestResults[MicTestSource.VOICE_RECOGNITION],
                 liveLevel = micLiveLevel?.takeIf { it.source == MicTestSource.VOICE_RECOGNITION },
                 running = runningMicTest == MicTestSource.VOICE_RECOGNITION,
@@ -304,6 +309,7 @@ private fun AndroidAutoToolsCard(
 
             MicSourceTestRow(
                 source = MicTestSource.MIC,
+                targetDeviceName = targetDeviceName,
                 result = micTestResults[MicTestSource.MIC],
                 liveLevel = micLiveLevel?.takeIf { it.source == MicTestSource.MIC },
                 running = runningMicTest == MicTestSource.MIC,
@@ -342,6 +348,7 @@ private fun AndroidAutoToolsCard(
 @Composable
 private fun MicSourceTestRow(
     source: MicTestSource,
+    targetDeviceName: String,
     result: AudioRoutingManager.MicTestResult?,
     liveLevel: AudioRoutingManager.MicLiveLevel?,
     running: Boolean,
@@ -381,7 +388,7 @@ private fun MicSourceTestRow(
                     Text(
                         when (liveLevel.phase) {
                             MicTestPhase.CALIBRATING -> "1/2 SILENZIO — calibrazione rumore"
-                            MicTestPhase.SPEAKING -> "2/2 PARLA NEL CARDO"
+                            MicTestPhase.SPEAKING -> "2/2 PARLA NEL MICROFONO DI $targetDeviceName"
                             MicTestPhase.FINISHED -> "Test completato"
                         },
                         style = MaterialTheme.typography.bodySmall,
@@ -504,7 +511,7 @@ private fun HowItWorksCard() {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Come funziona", style = MaterialTheme.typography.titleMedium)
             val steps = listOf(
-                "Il routing standard usa setCommunicationDevice per selezionare il Cardo come dispositivo di comunicazione.",
+                "Il routing standard usa setCommunicationDevice per selezionare il dispositivo Bluetooth prioritario come dispositivo di comunicazione.",
                 "Il fallback Android Auto usa Shizuku per tentare di forzare le policy COMMUNICATION e RECORD su BT SCO.",
                 "Il pulsante LOCK ripete entrambe le forzature per 30 secondi, utile se Android Auto sovrascrive il routing quando parte Gemini.",
                 "Ogni test calibra prima il rumore (resta in silenzio), poi misura la voce e mostra volume, soglia minima e ingresso realmente usato.",

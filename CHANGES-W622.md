@@ -1,5 +1,14 @@
 # BTMicFix W622 / Android Auto changes
 
+## 0.5.2-aa-generic-device
+
+- Removed hard-coded `Cardo` wording from the diagnostic UI and test results.
+- Test summaries now use the selected/requested Bluetooth device name (for example `soundcore AeroClip`, `Spirit Tracer`, or any future headset).
+- The live test prompt now says `PARLA NEL MICROFONO DI <device>`.
+- The force-routing button is now `Forza <device> ora`.
+- When no priority name is configured, the UI falls back to the currently active Bluetooth communication device name.
+- Technical behavior from 0.5.1 is unchanged: TEST remains passive and does not renegotiate SCO.
+
 ## 0.5.1-aa-safe-test
 
 - Fixed a regression where pressing a microphone TEST could re-assert/renegotiate the global SCO route. Diagnostic tests are now passive and never call `setCommunicationDevice()` or Shizuku force routing.
@@ -34,7 +43,7 @@ privileged UserService and exposes a real force-SCO action for COMMUNICATION + R
 
 ## 0.3.0-aa-diag
 - Added a real Bluetooth microphone diagnostic using `AudioRecord` + `VOICE_COMMUNICATION`.
-- The diagnostic explicitly calls `AudioRecord.setPreferredDevice()` on the Cardo SCO/BLE input.
+- The diagnostic explicitly calls `AudioRecord.setPreferredDevice()` on the selected Bluetooth SCO/BLE input.
 - Reports the actual `AudioRecord.routedDevice`, PCM peak/RMS, and a PASS/NO_AUDIO/WRONG_DEVICE verdict.
 - Added runtime `RECORD_AUDIO` permission request; audio is analyzed in memory only and never saved.
 - Moved raw green Shizuku/policy output to a dedicated **Dettagli tecnici** screen.

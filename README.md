@@ -1,4 +1,4 @@
-> W622 diagnostic build: **0.5.1-aa-safe-test**. Microphone TEST buttons are passive: they measure the already-active Cardo route without re-negotiating SCO. Only the explicit routing controls may change the global communication device.
+> W622 diagnostic build: **0.5.2-aa-generic-device**. Microphone TEST buttons are passive: they measure the already-active priority Bluetooth device without re-negotiating SCO. All diagnostic labels now use the actual/selected Bluetooth device name instead of a hard-coded headset name.
 
 # BTMicFix
 
@@ -131,11 +131,11 @@ This fork adds an explicit privileged fallback for the motorcycle Android Auto c
 
 1. Start Shizuku and grant BTMicFix permission.
 2. Connect Android Auto to the W622.
-3. Connect the Cardo to the phone.
-4. In BTMicFix select/route to the Cardo (BT SCO).
+3. Connect the Bluetooth headset/intercom to the phone.
+4. In BTMicFix select the headset/intercom as the priority Bluetooth device (BT SCO).
 5. Confirm the Shizuku card says **servizio privilegiato connesso**.
 6. Tap **LOCK ROUTING PER 30 SECONDI**.
-7. During those 30 seconds invoke Gemini/Assistant from the Cardo and speak into the Cardo mic.
+7. During those 30 seconds invoke Gemini/Assistant from the headset/intercom and speak into its microphone.
 8. Read the diagnostic result shown in BTMicFix. If it says the ROM blocks both reflection and
    `cmd audio set-force-use`, the limitation is below the normal app/Shizuku routing layer.
 

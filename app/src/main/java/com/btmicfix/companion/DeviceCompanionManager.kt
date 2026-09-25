@@ -48,7 +48,7 @@ class DeviceCompanionManager(private val context: Context) {
         val deviceFilter = BluetoothDeviceFilter.Builder().build()
         val associationRequest = AssociationRequest.Builder()
             .addDeviceFilter(deviceFilter)
-            // false is intentional: show the picker so the user can explicitly choose Cardo.
+            // false is intentional: show the picker so the user can explicitly choose the Bluetooth device.
             .setSingleDevice(false)
             .build()
 

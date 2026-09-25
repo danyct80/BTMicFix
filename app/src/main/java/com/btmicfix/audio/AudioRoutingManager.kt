@@ -113,6 +113,7 @@ class AudioRoutingManager(private val context: Context) {
     data class MicTestResult(
         val source: MicTestSource,
         val verdict: MicTestVerdict,
+        val targetDeviceName: String = "Dispositivo Bluetooth",
         val requestedInput: String,
         val actualInput: String,
         val preferredDeviceAccepted: Boolean,
@@ -133,9 +134,9 @@ class AudioRoutingManager(private val context: Context) {
 
         val summary: String
             get() = when (verdict) {
-                MicTestVerdict.PASS -> "Route Cardo + voce sopra soglia"
-                MicTestVerdict.NO_AUDIO -> "Cardo selezionato, voce sotto soglia"
-                MicTestVerdict.WRONG_DEVICE -> "Ingresso reale diverso dal Cardo"
+                MicTestVerdict.PASS -> "$targetDeviceName usato realmente come microfono"
+                MicTestVerdict.NO_AUDIO -> "$targetDeviceName selezionato, voce sotto soglia"
+                MicTestVerdict.WRONG_DEVICE -> "Ingresso reale diverso da $targetDeviceName"
                 MicTestVerdict.PERMISSION_REQUIRED -> "Permesso microfono necessario"
                 MicTestVerdict.ERROR -> "Test microfono non riuscito"
             }
@@ -361,6 +362,12 @@ class AudioRoutingManager(private val context: Context) {
         }
     }
 
+    fun currentBluetoothCommunicationDeviceName(): String? {
+        val device = audioManager.communicationDevice ?: return null
+        if (!isBluetoothMicType(device.type)) return null
+        return device.productName?.toString()?.takeIf { it.isNotBlank() }
+    }
+
     /**
      * Real-world SCO microphone test.
      *
@@ -376,6 +383,8 @@ class AudioRoutingManager(private val context: Context) {
         preferredAddress: String? = null,
         preferredName: String? = null,
     ): MicTestResult = withContext(Dispatchers.IO) {
+        val configuredTargetName = preferredName?.takeIf { it.isNotBlank() } ?: "Dispositivo Bluetooth"
+
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
         ) {
@@ -384,6 +393,7 @@ class AudioRoutingManager(private val context: Context) {
                 MicTestResult(
                     source = source,
                     verdict = MicTestVerdict.PERMISSION_REQUIRED,
+                    targetDeviceName = configuredTargetName,
                     requestedInput = "N/D",
                     actualInput = "N/D",
                     preferredDeviceAccepted = false,
@@ -400,7 +410,7 @@ class AudioRoutingManager(private val context: Context) {
         // IMPORTANT: the diagnostic test must be passive. It must never renegotiate SCO
         // or switch the global communication device just because TEST was pressed.
         // Read the actual system route and refuse the test if it is not already the
-        // selected priority device. The explicit "Forza Cardo ora" control remains the
+        // selected priority device. The explicit force-routing control remains the
         // only action allowed to change the communication route.
         val communicationDevice = audioManager.communicationDevice
         val hasPreference = !preferredAddress.isNullOrBlank() || !preferredName.isNullOrBlank()
@@ -411,6 +421,7 @@ class AudioRoutingManager(private val context: Context) {
                 MicTestResult(
                     source = source,
                     verdict = MicTestVerdict.WRONG_DEVICE,
+                    targetDeviceName = configuredTargetName,
                     requestedInput = preferredName ?: preferredAddress ?: "Dispositivo prioritario",
                     actualInput = communicationDevice?.let(::deviceLabel) ?: "Nessun communication device",
                     preferredDeviceAccepted = false,
@@ -425,7 +436,7 @@ class AudioRoutingManager(private val context: Context) {
                         appendLine("TEST_PASSIVE: routing non modificato")
                         appendLine("Priorita attesa: ${preferredName ?: preferredAddress}")
                         appendLine("Communication device reale: ${currentCommunicationDeviceLabel()}")
-                        append("Premi 'Forza Cardo ora' prima del test se necessario")
+                        append("Premi 'Forza ${configuredTargetName} ora' prima del test se necessario")
                     },
                 )
             )
@@ -450,6 +461,7 @@ class AudioRoutingManager(private val context: Context) {
                 MicTestResult(
                     source = source,
                     verdict = MicTestVerdict.WRONG_DEVICE,
+                    targetDeviceName = configuredTargetName,
                     requestedInput = "Nessun input BT SCO/BLE disponibile",
                     actualInput = "N/D",
                     preferredDeviceAccepted = false,
@@ -590,9 +602,13 @@ class AudioRoutingManager(private val context: Context) {
             }
 
             val elapsedTotal = SystemClock.elapsedRealtime() - start
+            val testedDeviceName = requestedInput.productName?.toString()?.takeIf { it.isNotBlank() }
+                ?: configuredTargetName
+
             val result = MicTestResult(
                 source = source,
                 verdict = verdict,
+                targetDeviceName = testedDeviceName,
                 requestedInput = deviceLabel(requestedInput),
                 actualInput = actualInput?.let(::deviceLabel) ?: "Nessun routedDevice riportato",
                 preferredDeviceAccepted = preferredAccepted,
@@ -650,6 +666,8 @@ class AudioRoutingManager(private val context: Context) {
                 MicTestResult(
                     source = source,
                     verdict = MicTestVerdict.ERROR,
+                    targetDeviceName = requestedInput.productName?.toString()?.takeIf { it.isNotBlank() }
+                        ?: configuredTargetName,
                     requestedInput = deviceLabel(requestedInput),
                     actualInput = recorder?.routedDevice?.let(::deviceLabel) ?: "N/D",
                     preferredDeviceAccepted = false,
