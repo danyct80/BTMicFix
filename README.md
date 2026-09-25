@@ -1,3 +1,5 @@
+> W622 diagnostic build: **0.5.1-aa-safe-test**. Microphone TEST buttons are passive: they measure the already-active Cardo route without re-negotiating SCO. Only the explicit routing controls may change the global communication device.
+
 # BTMicFix
 
 **Fix Bluetooth earbuds microphone routing for AI voice apps on Android.**

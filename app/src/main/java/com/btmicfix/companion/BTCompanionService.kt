@@ -104,9 +104,12 @@ class BTCompanionService : CompanionDeviceService() {
 
     override fun onDestroy() {
         super.onDestroy()
-        audioRoutingManager.clearRouting()
+        // Do NOT clear the global communication route here. CompanionDeviceService can
+        // be rebound/destroyed for lifecycle or association-management reasons even
+        // while the priority headset is still connected. Actual disconnect cleanup is
+        // handled in onDeviceDisappeared().
         audioRoutingManager.stopMonitoring()
-        Logger.i("BTCompanionService destroyed")
+        Logger.i("BTCompanionService destroyed without altering active audio routing")
     }
 
     /**

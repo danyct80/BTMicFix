@@ -290,7 +290,7 @@ private fun DeviceAssociationCard(
             Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Dispositivo prioritario", style = MaterialTheme.typography.titleMedium)
                 Text(
-                    "BTMicFix instraderà il microfono solo verso questo dispositivo. Un nuovo dispositivo prioritario sostituisce automaticamente il precedente.",
+                    "BTMicFix instraderà il microfono solo verso questo dispositivo. Puoi cambiare priorità senza eliminare le altre associazioni.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -319,7 +319,7 @@ private fun DeviceAssociationCard(
                     }
                 } else {
                     Text(
-                        "Trovate ${devices.size} associazioni precedenti. Scegli quella da mantenere: le altre verranno eliminate dall'app.",
+                        "Trovate ${devices.size} associazioni. Scegli il dispositivo prioritario; le altre restano disponibili finché non le rimuovi manualmente.",
                         style = MaterialTheme.typography.bodySmall,
                         color = StatusRouting,
                     )

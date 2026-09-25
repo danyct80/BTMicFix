@@ -165,11 +165,13 @@ private fun AndroidAutoToolsCard(
         scope.launch {
             try {
                 withContext(Dispatchers.IO) {
-                    val routed = audioRoutingManager.reassertPreferredRouting(preferredAddress, preferredName)
-                    if (routed) {
-                        if (ready) shizukuManager.forceBluetoothSco()
-                        audioRoutingManager.testBluetoothMicrophone(source = source)
-                    }
+                    // Diagnostic tests are deliberately passive in 0.5.1: pressing TEST
+                    // must not change the global SCO route or re-negotiate HFP.
+                    audioRoutingManager.testBluetoothMicrophone(
+                        source = source,
+                        preferredAddress = preferredAddress,
+                        preferredName = preferredName,
+                    )
                 }
             } finally {
                 runningMicTest = null

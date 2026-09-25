@@ -1,5 +1,15 @@
 # BTMicFix W622 / Android Auto changes
 
+## 0.5.1-aa-safe-test
+
+- Fixed a regression where pressing a microphone TEST could re-assert/renegotiate the global SCO route. Diagnostic tests are now passive and never call `setCommunicationDevice()` or Shizuku force routing.
+- The current system `AudioManager.communicationDevice` is now the routing source of truth; the per-instance cached route is no longer trusted across Activity/CompanionDeviceService lifecycles.
+- A preferred-device match now falls back safely to the unique Bluetooth product name when HyperOS does not expose the SCO MAC address through `AudioDeviceInfo.address`.
+- Selecting a priority Companion Device no longer auto-deletes other associations. They remain removable manually.
+- `BTCompanionService.onDestroy()` no longer clears active global audio routing; actual disconnect cleanup remains in `onDeviceDisappeared()`.
+- Live level, adaptive threshold, RMS/peak and the three source tests remain unchanged.
+
+
 Modified files:
 
 - `app/src/main/aidl/com/btmicfix/IPrivilegedService.aidl`

@@ -221,20 +221,54 @@ class AudioRoutingManager(private val context: Context) {
      * If a priority device exists but is not connected we DO NOT fall back to another
      * Bluetooth device (for example an Android Auto head unit).
      */
-    fun routeToPreferredBluetooth(address: String?, name: String?): RoutingState {
-        val devices = getAvailableCommunicationDevices().filter {
+    private fun bluetoothCommunicationDevices(): List<AudioDeviceInfo> =
+        getAvailableCommunicationDevices().filter {
             it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
         }
-        val hasPreference = !address.isNullOrBlank() || !name.isNullOrBlank()
 
-        val target = if (!address.isNullOrBlank()) {
-            devices.firstOrNull { it.address.equals(address, ignoreCase = true) }
-        } else {
-            devices.firstOrNull {
-                !name.isNullOrBlank() &&
-                    it.productName?.toString()?.equals(name, ignoreCase = true) == true
-            }
+    private fun deviceMatchesPreference(
+        device: AudioDeviceInfo?,
+        address: String?,
+        name: String?,
+    ): Boolean {
+        if (device == null) return false
+
+        // Prefer the MAC when Android exposes it. Some OEM builds return an empty
+        // AudioDeviceInfo.address for SCO devices, so a unique product name is the
+        // safe fallback rather than switching to the first Bluetooth device.
+        if (!address.isNullOrBlank() && device.address.isNotBlank()) {
+            if (device.address.equals(address, ignoreCase = true)) return true
         }
+
+        return !name.isNullOrBlank() &&
+            device.productName?.toString()?.equals(name, ignoreCase = true) == true
+    }
+
+    private fun findPreferredBluetoothCommunicationDevice(
+        address: String?,
+        name: String?,
+    ): AudioDeviceInfo? {
+        val devices = bluetoothCommunicationDevices()
+
+        if (!address.isNullOrBlank()) {
+            devices.firstOrNull {
+                it.address.isNotBlank() && it.address.equals(address, ignoreCase = true)
+            }?.let { return it }
+        }
+
+        if (!name.isNullOrBlank()) {
+            val byName = devices.filter {
+                it.productName?.toString()?.equals(name, ignoreCase = true) == true
+            }
+            if (byName.size == 1) return byName.first()
+        }
+
+        return null
+    }
+
+    fun routeToPreferredBluetooth(address: String?, name: String?): RoutingState {
+        val hasPreference = !address.isNullOrBlank() || !name.isNullOrBlank()
+        val target = findPreferredBluetoothCommunicationDevice(address, name)
 
         if (target != null) return routeToBluetooth(target)
 
@@ -248,21 +282,27 @@ class AudioRoutingManager(private val context: Context) {
         return routeToFirstAvailableBluetooth()
     }
 
+    /**
+     * Re-assert only when the SYSTEM communication device is not already the preferred
+     * one. This matters because the background CompanionDeviceService and the Activity
+     * own different AudioRoutingManager instances: currentRoutedDevice is therefore not
+     * a reliable source of truth across lifecycles.
+     */
     fun reassertPreferredRouting(address: String?, name: String?): Boolean {
-        val routed = currentRoutedDevice
-        val currentMatches = routed != null && if (!address.isNullOrBlank()) {
-            routed.address.equals(address, ignoreCase = true)
-        } else {
-            !name.isNullOrBlank() &&
-                routed.productName?.toString()?.equals(name, ignoreCase = true) == true
+        val systemDevice = audioManager.communicationDevice
+        if (deviceMatchesPreference(systemDevice, address, name)) {
+            currentRoutedDevice = systemDevice
+            val deviceName = systemDevice?.productName?.toString() ?: "Dispositivo Bluetooth"
+            _routingState.value = RoutingState.Active(deviceName)
+            Logger.d("Preferred routing already active on $deviceName; no SCO renegotiation")
+            return true
         }
 
-        return if (currentMatches) {
-            reassertCurrentRouting()
-        } else {
-            routeToPreferredBluetooth(address, name) is RoutingState.Active
-        }
+        return routeToPreferredBluetooth(address, name) is RoutingState.Active
     }
+
+    fun isPreferredCommunicationDeviceActive(address: String?, name: String?): Boolean =
+        deviceMatchesPreference(audioManager.communicationDevice, address, name)
 
     fun clearRouting() {
         Logger.i("Clearing audio routing")
@@ -333,6 +373,8 @@ class AudioRoutingManager(private val context: Context) {
     suspend fun testBluetoothMicrophone(
         source: MicTestSource = MicTestSource.VOICE_COMMUNICATION,
         durationMs: Long = 6_000L,
+        preferredAddress: String? = null,
+        preferredName: String? = null,
     ): MicTestResult = withContext(Dispatchers.IO) {
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
@@ -355,22 +397,51 @@ class AudioRoutingManager(private val context: Context) {
             )
         }
 
-        val communicationDevice = currentRoutedDevice ?: findFirstBluetoothCommunicationDevice()
+        // IMPORTANT: the diagnostic test must be passive. It must never renegotiate SCO
+        // or switch the global communication device just because TEST was pressed.
+        // Read the actual system route and refuse the test if it is not already the
+        // selected priority device. The explicit "Forza Cardo ora" control remains the
+        // only action allowed to change the communication route.
+        val communicationDevice = audioManager.communicationDevice
+        val hasPreference = !preferredAddress.isNullOrBlank() || !preferredName.isNullOrBlank()
 
-        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-        communicationDevice?.let {
-            val accepted = audioManager.setCommunicationDevice(it)
-            Logger.i("Mic test initial communication device accepted=$accepted")
+        if (hasPreference && !deviceMatchesPreference(communicationDevice, preferredAddress, preferredName)) {
+            _micLiveLevel.value = null
+            return@withContext publishMicTest(
+                MicTestResult(
+                    source = source,
+                    verdict = MicTestVerdict.WRONG_DEVICE,
+                    requestedInput = preferredName ?: preferredAddress ?: "Dispositivo prioritario",
+                    actualInput = communicationDevice?.let(::deviceLabel) ?: "Nessun communication device",
+                    preferredDeviceAccepted = false,
+                    communicationDevice = currentCommunicationDeviceLabel(),
+                    peak = 0,
+                    rms = 0.0,
+                    samplesRead = 0,
+                    durationMs = 0,
+                    details = buildString {
+                        appendLine("SOURCE=${source.label} (${source.audioSource})")
+                        appendLine("VERDICT=WRONG_DEVICE")
+                        appendLine("TEST_PASSIVE: routing non modificato")
+                        appendLine("Priorita attesa: ${preferredName ?: preferredAddress}")
+                        appendLine("Communication device reale: ${currentCommunicationDeviceLabel()}")
+                        append("Premi 'Forza Cardo ora' prima del test se necessario")
+                    },
+                )
+            )
         }
-        Thread.sleep(250)
 
         val inputDevices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).toList()
         val communicationName = communicationDevice?.productName?.toString()
+        val communicationAddress = communicationDevice?.address
         val bluetoothInputs = inputDevices.filter { isBluetoothMicType(it.type) }
-        val requestedInput = bluetoothInputs.firstOrNull {
+        val requestedInput = bluetoothInputs.firstOrNull { input ->
+            !communicationAddress.isNullOrBlank() && input.address.isNotBlank() &&
+                input.address.equals(communicationAddress, ignoreCase = true)
+        } ?: bluetoothInputs.firstOrNull { input ->
             communicationName != null &&
-                it.productName?.toString()?.equals(communicationName, ignoreCase = true) == true
-        } ?: bluetoothInputs.firstOrNull()
+                input.productName?.toString()?.equals(communicationName, ignoreCase = true) == true
+        }
 
         if (requestedInput == null) {
             val inputs = inputDevices.joinToString { deviceLabel(it) }

@@ -16,9 +16,9 @@ import com.btmicfix.util.Preferences
 /**
  * Manages Companion Device Manager (CDM) associations.
  *
- * Release 0.5 keeps ONE priority device. Selecting a new device automatically
- * removes the previous CDM associations, preventing an Android Auto head unit
- * from being treated as a microphone target by mistake.
+ * Release 0.5.1 keeps ONE priority device without deleting the other CDM
+ * associations automatically. Old/accidental associations remain visible and can
+ * be removed manually, avoiding CompanionDeviceService lifecycle side effects.
  */
 class DeviceCompanionManager(private val context: Context) {
 
@@ -137,7 +137,10 @@ class DeviceCompanionManager(private val context: Context) {
     fun getAssociatedDeviceNames(): List<String> = getAssociatedDevices().map { it.name }
 
     /**
-     * Keep only the selected association and make it the only automatic target.
+     * Make exactly one association the priority target, but do NOT delete the other
+     * associations automatically. Deleting/recreating CDM associations can cause the
+     * CompanionDeviceService to be rebound/destroyed and should never be coupled to
+     * an audio-routing test. The UI still offers explicit per-device removal.
      */
     fun makeExclusivePriority(associationId: Int): Boolean {
         val selected = getAssociations().firstOrNull { it.id == associationId } ?: return false
@@ -145,22 +148,33 @@ class DeviceCompanionManager(private val context: Context) {
     }
 
     private fun makeExclusivePriority(selected: AssociationInfo): Boolean {
-        val cdm = companionDeviceManager ?: return false
+        if (companionDeviceManager == null) return false
+
+        val previousAddress = preferences.pairedDeviceAddress
+        val selectedAddress = selected.deviceMacAddress?.toString()
+
+        if (!previousAddress.isNullOrBlank() &&
+            !selectedAddress.isNullOrBlank() &&
+            !previousAddress.equals(selectedAddress, ignoreCase = true)
+        ) {
+            stopObservingPresence(previousAddress)
+        }
 
         savePriority(selected)
         startObservingPresence(selected)
-
-        getAssociations()
-            .filter { it.id != selected.id }
-            .forEach { old ->
-                try {
-                    cdm.disassociate(old.id)
-                    Logger.i("Removed old CDM association ${old.id}; priority=${selected.id}")
-                } catch (e: Exception) {
-                    Logger.e("Failed to remove old association ${old.id}", e)
-                }
-            }
+        Logger.i("Priority association changed to ${selected.id}; other CDM associations preserved")
         return true
+    }
+
+    private fun stopObservingPresence(address: String) {
+        val cdm = companionDeviceManager ?: return
+        try {
+            cdm.stopObservingDevicePresence(address)
+            Logger.i("Stopped observing previous priority device presence")
+        } catch (e: Exception) {
+            // Safe to ignore when the address was not being observed.
+            Logger.d("Previous device presence was not active: ${e.javaClass.simpleName}")
+        }
     }
 
     /**
