@@ -26,6 +26,7 @@ import com.btmicfix.audio.AudioRoutingManager.MicTestPhase
 import com.btmicfix.audio.AudioRoutingManager.MicTestSource
 import com.btmicfix.audio.AudioRoutingManager.MicTestVerdict
 import com.btmicfix.audio.AudioRoutingManager.RoutingState
+import com.btmicfix.companion.DeviceCompanionManager
 import com.btmicfix.shizuku.ShizukuManager
 import com.btmicfix.shizuku.ShizukuManager.ShizukuStatus
 import com.btmicfix.shizuku.ShizukuManager.UserServiceState
@@ -33,7 +34,6 @@ import com.btmicfix.ui.components.DeviceSelector
 import com.btmicfix.ui.components.ShizukuStatusCard
 import com.btmicfix.ui.components.StatusCard
 import com.btmicfix.ui.theme.*
-import com.btmicfix.util.Preferences
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -45,7 +45,7 @@ import kotlinx.coroutines.withContext
 fun HomeScreen(
     audioRoutingManager: AudioRoutingManager,
     shizukuManager: ShizukuManager,
-    preferences: Preferences,
+    companionManager: DeviceCompanionManager,
     onSetupClick: () -> Unit,
     onDetailsClick: () -> Unit,
     modifier: Modifier = Modifier,
@@ -54,9 +54,17 @@ fun HomeScreen(
     val availableDevices by audioRoutingManager.availableDevices.collectAsState()
     val shizukuStatus by shizukuManager.status.collectAsState()
     val serviceState by shizukuManager.serviceState.collectAsState()
-    val lastForceResult by shizukuManager.lastForceResult.collectAsState()
     val micTestResults by audioRoutingManager.micTestResults.collectAsState()
     val micLiveLevel by audioRoutingManager.micLiveLevel.collectAsState()
+    val priorityDevice = remember(availableDevices) { companionManager.getPriorityDevice() }
+    val preferredAddress = priorityDevice?.address
+    val preferredName = priorityDevice?.name
+    val preferredAvailable = audioRoutingManager.isPreferredBluetoothAvailable(preferredAddress, preferredName)
+
+    LaunchedEffect(preferredAddress, preferredName) {
+        audioRoutingManager.clearMicDiagnostics()
+        shizukuManager.clearLastForceResult()
+    }
 
     Scaffold(
         modifier = modifier,
@@ -91,8 +99,8 @@ fun HomeScreen(
                 routingState = routingState,
                 onEnableRouting = {
                     audioRoutingManager.routeToPreferredBluetooth(
-                        preferences.pairedDeviceAddress,
-                        preferences.pairedDeviceName,
+                        preferredAddress,
+                        preferredName,
                     )
                 },
                 onDisableRouting = {
@@ -101,10 +109,12 @@ fun HomeScreen(
                 },
                 onRetry = {
                     audioRoutingManager.routeToPreferredBluetooth(
-                        preferences.pairedDeviceAddress,
-                        preferences.pairedDeviceName,
+                        preferredAddress,
+                        preferredName,
                     )
                 },
+                canEnable = preferredAvailable,
+                targetName = preferredName,
             )
 
             DeviceSelector(
@@ -119,11 +129,11 @@ fun HomeScreen(
                 shizukuManager = shizukuManager,
                 shizukuStatus = shizukuStatus,
                 serviceState = serviceState,
-                lastForceResult = lastForceResult,
                 micTestResults = micTestResults,
                 micLiveLevel = micLiveLevel,
-                preferredAddress = preferences.pairedDeviceAddress,
-                preferredName = preferences.pairedDeviceName,
+                preferredAddress = preferredAddress,
+                preferredName = preferredName,
+                preferredAvailable = preferredAvailable,
                 onDetailsClick = onDetailsClick,
             )
 
@@ -143,11 +153,11 @@ private fun AndroidAutoToolsCard(
     shizukuManager: ShizukuManager,
     shizukuStatus: ShizukuStatus,
     serviceState: UserServiceState,
-    lastForceResult: String?,
     micTestResults: Map<MicTestSource, AudioRoutingManager.MicTestResult>,
     micLiveLevel: AudioRoutingManager.MicLiveLevel?,
     preferredAddress: String?,
     preferredName: String?,
+    preferredAvailable: Boolean,
     onDetailsClick: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
@@ -156,11 +166,10 @@ private fun AndroidAutoToolsCard(
     var lockActive by remember { mutableStateOf(false) }
     var runningMicTest by remember { mutableStateOf<MicTestSource?>(null) }
     var pendingMicTest by remember { mutableStateOf<MicTestSource?>(null) }
+    var forceUiMessage by remember(preferredAddress, preferredName) { mutableStateOf<String?>(null) }
 
     val ready = shizukuStatus == ShizukuStatus.READY && serviceState == UserServiceState.READY
-    val targetDeviceName = preferredName?.takeIf { it.isNotBlank() }
-        ?: audioRoutingManager.currentBluetoothCommunicationDeviceName()
-        ?: "dispositivo Bluetooth"
+    val targetDeviceName = preferredName?.takeIf { it.isNotBlank() } ?: "dispositivo prioritario"
 
     fun launchMicTest(source: MicTestSource) {
         if (runningMicTest != null) return
@@ -205,15 +214,6 @@ private fun AndroidAutoToolsCard(
         onDispose { lockJob?.cancel() }
     }
 
-    val forceSummary = when {
-        lastForceResult.isNullOrBlank() -> null
-        lastForceResult.contains("RESULT=FAILED", ignoreCase = true) ||
-            lastForceResult.contains("ERRORE", ignoreCase = true) -> "Forzatura Shizuku non riuscita"
-        lastForceResult.contains("AudioSystem.setForceUse(0,3) -> 0") &&
-            lastForceResult.contains("AudioSystem.setForceUse(2,3) -> 0") -> "Policy SCO COMMUNICATION + RECORD forzate"
-        else -> "Forzatura Shizuku eseguita: controlla Dettagli"
-    }
-
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
@@ -236,24 +236,39 @@ private fun AndroidAutoToolsCard(
             )
 
             Button(
-                enabled = ready,
+                enabled = ready && preferredAvailable,
                 onClick = {
+                    forceUiMessage = null
                     scope.launch {
-                        withContext(Dispatchers.IO) {
+                        val message = withContext(Dispatchers.IO) {
                             if (audioRoutingManager.reassertPreferredRouting(preferredAddress, preferredName)) {
-                                shizukuManager.forceBluetoothSco()
+                                val raw = shizukuManager.forceBluetoothSco()
+                                when {
+                                    raw.contains("RESULT=FAILED", ignoreCase = true) ||
+                                        raw.contains("ERRORE", ignoreCase = true) -> "Forzatura Shizuku non riuscita"
+                                    raw.contains("AudioSystem.setForceUse(0,3) -> 0") &&
+                                        raw.contains("AudioSystem.setForceUse(2,3) -> 0") -> "Policy SCO COMMUNICATION + RECORD forzate"
+                                    else -> "Forzatura Shizuku eseguita: controlla Dettagli"
+                                }
+                            } else {
+                                "$targetDeviceName non connesso: nessuna forzatura eseguita"
                             }
                         }
+                        forceUiMessage = message
                     }
                 },
                 modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = Purple40),
             ) {
-                Text("Forza $targetDeviceName ora")
+                Text(
+                    if (preferredAvailable) "Forza $targetDeviceName ora"
+                    else if (preferredName == null) "Seleziona un dispositivo prioritario"
+                    else "$targetDeviceName non connesso"
+                )
             }
 
             OutlinedButton(
-                enabled = ready,
+                enabled = ready && preferredAvailable,
                 onClick = {
                     if (lockActive) {
                         lockJob?.cancel()
@@ -293,7 +308,7 @@ private fun AndroidAutoToolsCard(
                 result = micTestResults[MicTestSource.VOICE_COMMUNICATION],
                 liveLevel = micLiveLevel?.takeIf { it.source == MicTestSource.VOICE_COMMUNICATION },
                 running = runningMicTest == MicTestSource.VOICE_COMMUNICATION,
-                enabled = runningMicTest == null,
+                enabled = runningMicTest == null && preferredAvailable,
                 onTest = { requestMicTest(MicTestSource.VOICE_COMMUNICATION) },
             )
 
@@ -303,7 +318,7 @@ private fun AndroidAutoToolsCard(
                 result = micTestResults[MicTestSource.VOICE_RECOGNITION],
                 liveLevel = micLiveLevel?.takeIf { it.source == MicTestSource.VOICE_RECOGNITION },
                 running = runningMicTest == MicTestSource.VOICE_RECOGNITION,
-                enabled = runningMicTest == null,
+                enabled = runningMicTest == null && preferredAvailable,
                 onTest = { requestMicTest(MicTestSource.VOICE_RECOGNITION) },
             )
 
@@ -313,15 +328,15 @@ private fun AndroidAutoToolsCard(
                 result = micTestResults[MicTestSource.MIC],
                 liveLevel = micLiveLevel?.takeIf { it.source == MicTestSource.MIC },
                 running = runningMicTest == MicTestSource.MIC,
-                enabled = runningMicTest == null,
+                enabled = runningMicTest == null && preferredAvailable,
                 onTest = { requestMicTest(MicTestSource.MIC) },
             )
 
-            forceSummary?.let {
+            forceUiMessage?.let {
                 Text(
                     it,
                     style = MaterialTheme.typography.bodySmall,
-                    color = if (it.contains("non riuscita")) StatusFailed else StatusActive,
+                    color = if (it.contains("non riuscita") || it.contains("non connesso")) StatusFailed else StatusActive,
                 )
             }
 
@@ -337,6 +352,13 @@ private fun AndroidAutoToolsCard(
             if (!ready) {
                 Text(
                     "Per le forzature avanzate Shizuku deve essere pronto e autorizzato.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = StatusRouting,
+                )
+            } else if (!preferredAvailable) {
+                Text(
+                    if (preferredName == null) "Seleziona prima un dispositivo prioritario in Configurazione."
+                    else "$targetDeviceName non e attualmente disponibile come dispositivo Bluetooth di comunicazione.",
                     style = MaterialTheme.typography.bodySmall,
                     color = StatusRouting,
                 )
@@ -359,6 +381,8 @@ private fun MicSourceTestRow(
         MicTestVerdict.PASS -> StatusActive
         MicTestVerdict.NO_AUDIO -> StatusRouting
         MicTestVerdict.WRONG_DEVICE,
+        MicTestVerdict.TARGET_NOT_CONFIGURED,
+        MicTestVerdict.TARGET_NOT_CONNECTED,
         MicTestVerdict.ERROR,
         MicTestVerdict.PERMISSION_REQUIRED,
         -> StatusFailed
@@ -453,17 +477,25 @@ private fun RoutingControlButton(
     onEnableRouting: () -> Unit,
     onDisableRouting: () -> Unit,
     onRetry: () -> Unit,
+    canEnable: Boolean,
+    targetName: String?,
 ) {
     when (routingState) {
         is RoutingState.Idle -> Button(
             onClick = onEnableRouting,
+            enabled = canEnable,
             modifier = Modifier.fillMaxWidth().height(56.dp),
             shape = RoundedCornerShape(16.dp),
             colors = ButtonDefaults.buttonColors(containerColor = Purple40),
         ) {
             Icon(Icons.Default.PowerSettingsNew, contentDescription = null, modifier = Modifier.size(20.dp))
             Spacer(modifier = Modifier.width(8.dp))
-            Text("Attiva instradamento", style = MaterialTheme.typography.labelLarge)
+            Text(
+                if (canEnable) "Attiva instradamento"
+                else if (targetName == null) "Seleziona dispositivo prioritario"
+                else "$targetName non connesso",
+                style = MaterialTheme.typography.labelLarge,
+            )
         }
 
         is RoutingState.Routing -> Button(
@@ -490,6 +522,7 @@ private fun RoutingControlButton(
 
         is RoutingState.Failed -> Button(
             onClick = onRetry,
+            enabled = canEnable,
             modifier = Modifier.fillMaxWidth().height(56.dp),
             shape = RoundedCornerShape(16.dp),
             colors = ButtonDefaults.buttonColors(containerColor = StatusFailed.copy(alpha = 0.8f)),

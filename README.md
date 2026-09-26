@@ -1,4 +1,6 @@
-> W622 diagnostic build: **0.5.2-aa-generic-device**. Microphone TEST buttons are passive: they measure the already-active priority Bluetooth device without re-negotiating SCO. All diagnostic labels now use the actual/selected Bluetooth device name instead of a hard-coded headset name.
+**W622 diagnostic branch: 0.5.3-stable-identity**
+
+W622 diagnostic build: **0.5.3-stable-identity**. Device identity is based on the Companion association/MAC, never on a cached friendly name. Microphone TEST buttons remain passive: they measure the already-active priority Bluetooth device without re-negotiating SCO.
 
 # BTMicFix
 

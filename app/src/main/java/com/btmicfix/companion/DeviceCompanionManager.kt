@@ -1,14 +1,20 @@
 package com.btmicfix.companion
 
+import android.Manifest
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothManager
 import android.companion.AssociationInfo
 import android.companion.AssociationRequest
 import android.companion.BluetoothDeviceFilter
 import android.companion.CompanionDeviceManager
 import android.content.Context
 import android.content.IntentSender
+import android.content.pm.PackageManager
 import android.os.Build
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.IntentSenderRequest
+import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import com.btmicfix.util.Logger
 import com.btmicfix.util.Preferences
@@ -16,9 +22,12 @@ import com.btmicfix.util.Preferences
 /**
  * Manages Companion Device Manager (CDM) associations.
  *
- * Release 0.5.1 keeps ONE priority device without deleting the other CDM
- * associations automatically. Old/accidental associations remain visible and can
- * be removed manually, avoiding CompanionDeviceService lifecycle side effects.
+ * 0.5.3 rules:
+ * - exactly one explicit priority association;
+ * - association id / MAC are identity, never the friendly name;
+ * - friendly names are resolved live from Bluetooth when possible;
+ * - no automatic adoption of a leftover association;
+ * - stale priority preferences are cleared automatically.
  */
 class DeviceCompanionManager(private val context: Context) {
 
@@ -31,6 +40,9 @@ class DeviceCompanionManager(private val context: Context) {
 
     private val companionDeviceManager: CompanionDeviceManager? =
         context.getSystemService<CompanionDeviceManager>()
+
+    private val bluetoothAdapter: BluetoothAdapter? =
+        context.getSystemService<BluetoothManager>()?.adapter
 
     private val preferences = Preferences(context)
 
@@ -48,7 +60,6 @@ class DeviceCompanionManager(private val context: Context) {
         val deviceFilter = BluetoothDeviceFilter.Builder().build()
         val associationRequest = AssociationRequest.Builder()
             .addDeviceFilter(deviceFilter)
-            // false is intentional: show the picker so the user can explicitly choose the Bluetooth device.
             .setSingleDevice(false)
             .build()
 
@@ -80,23 +91,8 @@ class DeviceCompanionManager(private val context: Context) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             cdm.associate(associationRequest, context.mainExecutor, callback)
         } else {
+            @Suppress("DEPRECATION")
             cdm.associate(associationRequest, callback, null)
-        }
-    }
-
-    fun startObservingPresence(associationInfo: AssociationInfo) {
-        val cdm = companionDeviceManager ?: return
-        val address = associationInfo.deviceMacAddress?.toString()
-        if (address.isNullOrBlank()) {
-            Logger.w("Cannot observe association ${associationInfo.id}: Bluetooth address unavailable")
-            return
-        }
-        try {
-            // The String overload expects a Bluetooth MAC address, not an association ID.
-            cdm.startObservingDevicePresence(address)
-            Logger.i("Started observing presence for association ${associationInfo.id}")
-        } catch (e: Exception) {
-            Logger.e("Failed to start observing presence", e)
         }
     }
 
@@ -110,38 +106,57 @@ class DeviceCompanionManager(private val context: Context) {
         }
     }
 
-    fun getAssociatedDevices(): List<AssociatedDevice> {
-        val preferredAddress = preferences.pairedDeviceAddress
-        val preferredName = preferences.pairedDeviceName
+    /** Remove stale preference state left by older builds or manual association cleanup. */
+    fun reconcilePriority(): AssociatedDevice? {
         val associations = getAssociations()
+        if (!preferences.hasPreferredDevice()) return null
 
-        // Migration path: if only one legacy association exists, adopt it as priority.
-        if (associations.size == 1 && preferredAddress.isNullOrBlank() && preferredName.isNullOrBlank()) {
-            savePriority(associations.first())
+        val selected = associations.firstOrNull { info ->
+            preferences.isPreferredAssociation(
+                associationId = info.id,
+                address = info.deviceMacAddress?.toString(),
+            )
         }
 
-        return associations.map { info ->
-            val address = info.deviceMacAddress?.toString()
-            val name = info.displayName?.toString()
-                ?: address
-                ?: "Dispositivo sconosciuto"
-            AssociatedDevice(
-                associationId = info.id,
-                name = name,
-                address = address,
-                isPriority = matchesPreference(info),
+        if (selected == null) {
+            Logger.w("Stored priority no longer exists in CDM; clearing stale priority")
+            preferences.clearPairedDevice()
+            return null
+        }
+
+        savePriority(selected)
+        return selected.toAssociatedDevice(isPriority = true)
+    }
+
+    fun getAssociatedDevices(): List<AssociatedDevice> {
+        reconcilePriority()
+        return getAssociations().map { info ->
+            info.toAssociatedDevice(
+                isPriority = preferences.isPreferredAssociation(
+                    associationId = info.id,
+                    address = info.deviceMacAddress?.toString(),
+                )
             )
         }
     }
 
+    fun getPriorityDevice(): AssociatedDevice? {
+        reconcilePriority()
+        return getAssociatedDevicesNoReconcile().firstOrNull { it.isPriority }
+    }
+
+    private fun getAssociatedDevicesNoReconcile(): List<AssociatedDevice> =
+        getAssociations().map { info ->
+            info.toAssociatedDevice(
+                isPriority = preferences.isPreferredAssociation(
+                    associationId = info.id,
+                    address = info.deviceMacAddress?.toString(),
+                )
+            )
+        }
+
     fun getAssociatedDeviceNames(): List<String> = getAssociatedDevices().map { it.name }
 
-    /**
-     * Make exactly one association the priority target, but do NOT delete the other
-     * associations automatically. Deleting/recreating CDM associations can cause the
-     * CompanionDeviceService to be rebound/destroyed and should never be coupled to
-     * an audio-routing test. The UI still offers explicit per-device removal.
-     */
     fun makeExclusivePriority(associationId: Int): Boolean {
         val selected = getAssociations().firstOrNull { it.id == associationId } ?: return false
         return makeExclusivePriority(selected)
@@ -166,26 +181,16 @@ class DeviceCompanionManager(private val context: Context) {
         return true
     }
 
-    private fun stopObservingPresence(address: String) {
-        val cdm = companionDeviceManager ?: return
-        try {
-            cdm.stopObservingDevicePresence(address)
-            Logger.i("Stopped observing previous priority device presence")
-        } catch (e: Exception) {
-            // Safe to ignore when the address was not being observed.
-            Logger.d("Previous device presence was not active: ${e.javaClass.simpleName}")
-        }
-    }
-
-    /**
-     * Remove one CDM association only. Bluetooth pairing itself is left untouched.
-     */
     fun removeAssociation(associationId: Int): Boolean {
         val cdm = companionDeviceManager ?: return false
         val target = getAssociations().firstOrNull { it.id == associationId }
         return try {
             cdm.disassociate(associationId)
-            if (target != null && matchesPreference(target)) {
+            if (target != null && preferences.isPreferredAssociation(
+                    target.id,
+                    target.deviceMacAddress?.toString(),
+                )
+            ) {
                 preferences.clearPairedDevice()
             }
             Logger.i("Removed CDM association $associationId")
@@ -196,42 +201,125 @@ class DeviceCompanionManager(private val context: Context) {
         }
     }
 
-    fun removeAllAssociations() {
-        getAssociations().forEach { removeAssociation(it.id) }
+    /** Removes BTMicFix companion associations and priority state. Bluetooth pairing is untouched. */
+    fun resetAssociationsAndPriority() {
+        getAssociations().forEach { info ->
+            try {
+                companionDeviceManager?.disassociate(info.id)
+            } catch (e: Exception) {
+                Logger.w("Could not remove CDM association ${info.id}: ${e.javaClass.simpleName}")
+            }
+        }
         preferences.clearPairedDevice()
+        Logger.i("BTMicFix associations and priority reset")
     }
 
-    /**
-     * Observe ONLY the priority device. This prevents stale legacy associations
-     * (for example Carplay Tracer) from triggering the routing service.
-     */
-    fun resumeObservingAllAssociations() {
-        val associations = getAssociations()
-        if (associations.isEmpty()) return
-
-        val priority = associations.firstOrNull { matchesPreference(it) }
-            ?: associations.singleOrNull()?.also { savePriority(it) }
-
-        if (priority == null) {
-            Logger.w("Multiple legacy associations found and no unambiguous priority; waiting for user selection")
+    fun startObservingPresence(associationInfo: AssociationInfo) {
+        val cdm = companionDeviceManager ?: return
+        val address = associationInfo.deviceMacAddress?.toString()
+        if (address.isNullOrBlank()) {
+            Logger.w("Cannot observe association ${associationInfo.id}: Bluetooth address unavailable")
             return
         }
-
-        startObservingPresence(priority)
-        Logger.i("Resumed observing priority association ${priority.id}")
+        try {
+            cdm.startObservingDevicePresence(address)
+            Logger.i("Started observing presence for association ${associationInfo.id}")
+        } catch (e: Exception) {
+            Logger.e("Failed to start observing presence", e)
+        }
     }
 
-    fun isPriorityAssociation(associationInfo: AssociationInfo): Boolean = matchesPreference(associationInfo)
+    private fun stopObservingPresence(address: String) {
+        val cdm = companionDeviceManager ?: return
+        try {
+            cdm.stopObservingDevicePresence(address)
+            Logger.i("Stopped observing previous priority device presence")
+        } catch (e: Exception) {
+            Logger.d("Previous device presence was not active: ${e.javaClass.simpleName}")
+        }
+    }
+
+    /** Observe only an explicit, valid priority. Never auto-select a leftover association. */
+    fun resumeObservingPriorityAssociation() {
+        val priority = reconcilePriority() ?: return
+        val association = getAssociations().firstOrNull { it.id == priority.associationId } ?: return
+        startObservingPresence(association)
+        Logger.i("Resumed observing priority association ${association.id}")
+    }
+
+    // Backward-compatible method name used by older call sites.
+    fun resumeObservingAllAssociations() = resumeObservingPriorityAssociation()
+
+    fun isPriorityAssociation(associationInfo: AssociationInfo): Boolean =
+        preferences.isPreferredAssociation(
+            associationId = associationInfo.id,
+            address = associationInfo.deviceMacAddress?.toString(),
+        )
+
+    /** Friendly name for UI only. */
+    fun priorityDisplayName(): String? = getPriorityDevice()?.name
 
     private fun savePriority(info: AssociationInfo) {
-        preferences.pairedDeviceName = info.displayName?.toString()
-        preferences.pairedDeviceAddress = info.deviceMacAddress?.toString()
-        Logger.i("Priority device saved: ${preferences.pairedDeviceName ?: "unnamed"}")
+        val address = info.deviceMacAddress?.toString()
+        val name = resolveFriendlyName(info)
+        preferences.pairedAssociationId = info.id
+        preferences.pairedDeviceAddress = address
+        preferences.pairedDeviceName = name
+        Logger.i("Priority device saved: $name association=${info.id}")
     }
 
-    private fun matchesPreference(info: AssociationInfo): Boolean {
+    private fun AssociationInfo.toAssociatedDevice(isPriority: Boolean): AssociatedDevice =
+        AssociatedDevice(
+            associationId = id,
+            name = resolveFriendlyName(this),
+            address = deviceMacAddress?.toString(),
+            isPriority = isPriority,
+        )
+
+    /**
+     * CDM can expose only a MAC address in its picker/AssociationInfo. Resolve the user-visible
+     * Bluetooth alias/name directly from Android whenever possible, then fall back to CDM/MAC.
+     */
+    private fun resolveFriendlyName(info: AssociationInfo): String {
         val address = info.deviceMacAddress?.toString()
-        val name = info.displayName?.toString()
-        return preferences.isPreferredDevice(address, name)
+        resolveBluetoothName(address)?.let { return it }
+
+        val cdmName = info.displayName?.toString()?.trim()
+        if (!cdmName.isNullOrBlank() && !looksLikeMac(cdmName)) return cdmName
+
+        return address ?: cdmName ?: "Dispositivo Bluetooth sconosciuto"
     }
+
+    @Suppress("MissingPermission")
+    private fun resolveBluetoothName(address: String?): String? {
+        if (address.isNullOrBlank()) return null
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) !=
+            PackageManager.PERMISSION_GRANTED
+        ) return null
+
+        val adapter = bluetoothAdapter ?: return null
+        return try {
+            val device = adapter.bondedDevices.firstOrNull {
+                it.address.equals(address, ignoreCase = true)
+            } ?: adapter.getRemoteDevice(address)
+
+            bluetoothDeviceFriendlyName(device)
+        } catch (e: Exception) {
+            Logger.d("Could not resolve Bluetooth name for address: ${e.javaClass.simpleName}")
+            null
+        }
+    }
+
+    @Suppress("MissingPermission")
+    private fun bluetoothDeviceFriendlyName(device: BluetoothDevice): String? {
+        val alias = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try { device.alias } catch (_: Exception) { null }
+        } else null
+        val name = try { device.name } catch (_: Exception) { null }
+        return alias?.takeIf { it.isNotBlank() && !looksLikeMac(it) }
+            ?: name?.takeIf { it.isNotBlank() && !looksLikeMac(it) }
+    }
+
+    private fun looksLikeMac(value: String): Boolean =
+        Regex("(?i)^[0-9A-F]{2}(:[0-9A-F]{2}){5}$").matches(value.trim())
 }

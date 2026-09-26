@@ -44,10 +44,14 @@ class MainActivity : ComponentActivity(), BluetoothStateReceiver.BluetoothConnec
         companionManager = DeviceCompanionManager(this)
         preferences = Preferences(this)
 
+        // Reconcile persisted priority before any routing/background observation.
+        // Old/stale preferences must never resurrect a previously selected headset.
+        companionManager.reconcilePriority()
+
         // Start monitoring
         audioRoutingManager.startMonitoring()
         shizukuManager.initialize()
-        companionManager.resumeObservingAllAssociations()
+        companionManager.resumeObservingPriorityAssociation()
 
         // Register BT state listener
         BluetoothStateReceiver.listener = this
@@ -72,7 +76,7 @@ class MainActivity : ComponentActivity(), BluetoothStateReceiver.BluetoothConnec
                         HomeScreen(
                             audioRoutingManager = audioRoutingManager,
                             shizukuManager = shizukuManager,
-                            preferences = preferences,
+                            companionManager = companionManager,
                             onSetupClick = { currentScreen = Screen.Setup },
                             onDetailsClick = { currentScreen = Screen.Details },
                             modifier = Modifier.fillMaxSize(),
@@ -83,7 +87,6 @@ class MainActivity : ComponentActivity(), BluetoothStateReceiver.BluetoothConnec
                             audioRoutingManager = audioRoutingManager,
                             shizukuManager = shizukuManager,
                             companionManager = companionManager,
-                            preferences = preferences,
                             onBackClick = {
                                 preferences.setupCompleted = true
                                 currentScreen = Screen.Home
@@ -106,7 +109,8 @@ class MainActivity : ComponentActivity(), BluetoothStateReceiver.BluetoothConnec
 
     override fun onResume() {
         super.onResume()
-        // Refresh states when returning to the app
+        // Refresh states when returning to the app and drop any stale priority state.
+        companionManager.reconcilePriority()
         shizukuManager.refreshStatus()
     }
 
@@ -129,9 +133,10 @@ class MainActivity : ComponentActivity(), BluetoothStateReceiver.BluetoothConnec
         val deviceName = try { device.name } catch (_: SecurityException) { null }
         if (preferences.autoRouteEnabled && preferences.isPreferredDevice(device.address, deviceName)) {
             Logger.i("Auto-routing triggered by PRIORITY BT device connect")
+            val priority = companionManager.getPriorityDevice()
             audioRoutingManager.routeToPreferredBluetooth(
-                preferences.pairedDeviceAddress,
-                preferences.pairedDeviceName,
+                priority?.address,
+                priority?.name,
             )
         } else {
             Logger.d("Ignoring non-priority BT connection: ${deviceName ?: "unknown"}")

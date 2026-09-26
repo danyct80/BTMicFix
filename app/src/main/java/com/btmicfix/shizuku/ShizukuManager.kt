@@ -201,6 +201,10 @@ class ShizukuManager {
         }
     }
 
+    fun clearLastForceResult() {
+        _lastForceResult.value = null
+    }
+
     fun clearForcedBluetoothSco(): String {
         val service = privilegedService
         if (service == null || !service.asBinder().pingBinder()) {

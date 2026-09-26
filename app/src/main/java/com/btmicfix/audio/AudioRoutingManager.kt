@@ -56,6 +56,7 @@ class AudioRoutingManager(private val context: Context) {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
             Logger.i("Audio devices added: ${addedDevices.map { deviceTypeToString(it.type) }}")
             refreshAvailableDevices()
+            syncRoutingStateWithSystem()
         }
 
         override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
@@ -67,6 +68,7 @@ class AudioRoutingManager(private val context: Context) {
                 }
             }
             refreshAvailableDevices()
+            syncRoutingStateWithSystem()
         }
     }
 
@@ -137,6 +139,8 @@ class AudioRoutingManager(private val context: Context) {
                 MicTestVerdict.PASS -> "$targetDeviceName usato realmente come microfono"
                 MicTestVerdict.NO_AUDIO -> "$targetDeviceName selezionato, voce sotto soglia"
                 MicTestVerdict.WRONG_DEVICE -> "Ingresso reale diverso da $targetDeviceName"
+                MicTestVerdict.TARGET_NOT_CONFIGURED -> "Nessun dispositivo prioritario selezionato"
+                MicTestVerdict.TARGET_NOT_CONNECTED -> "$targetDeviceName non connesso"
                 MicTestVerdict.PERMISSION_REQUIRED -> "Permesso microfono necessario"
                 MicTestVerdict.ERROR -> "Test microfono non riuscito"
             }
@@ -146,6 +150,8 @@ class AudioRoutingManager(private val context: Context) {
         PASS,
         NO_AUDIO,
         WRONG_DEVICE,
+        TARGET_NOT_CONFIGURED,
+        TARGET_NOT_CONNECTED,
         PERMISSION_REQUIRED,
         ERROR,
     }
@@ -154,6 +160,7 @@ class AudioRoutingManager(private val context: Context) {
         Logger.i("Starting audio device monitoring")
         audioManager.registerAudioDeviceCallback(deviceCallback, null)
         refreshAvailableDevices()
+        syncRoutingStateWithSystem()
     }
 
     fun stopMonitoring() {
@@ -238,10 +245,12 @@ class AudioRoutingManager(private val context: Context) {
         // AudioDeviceInfo.address for SCO devices, so a unique product name is the
         // safe fallback rather than switching to the first Bluetooth device.
         if (!address.isNullOrBlank() && device.address.isNotBlank()) {
-            if (device.address.equals(address, ignoreCase = true)) return true
+            return device.address.equals(address, ignoreCase = true)
         }
 
+        // Name fallback is allowed only when Android does not expose the AudioDeviceInfo MAC.
         return !name.isNullOrBlank() &&
+            device.address.isBlank() &&
             device.productName?.toString()?.equals(name, ignoreCase = true) == true
     }
 
@@ -259,7 +268,8 @@ class AudioRoutingManager(private val context: Context) {
 
         if (!name.isNullOrBlank()) {
             val byName = devices.filter {
-                it.productName?.toString()?.equals(name, ignoreCase = true) == true
+                it.address.isBlank() &&
+                    it.productName?.toString()?.equals(name, ignoreCase = true) == true
             }
             if (byName.size == 1) return byName.first()
         }
@@ -269,18 +279,25 @@ class AudioRoutingManager(private val context: Context) {
 
     fun routeToPreferredBluetooth(address: String?, name: String?): RoutingState {
         val hasPreference = !address.isNullOrBlank() || !name.isNullOrBlank()
-        val target = findPreferredBluetoothCommunicationDevice(address, name)
-
-        if (target != null) return routeToBluetooth(target)
-
-        if (hasPreference) {
-            val state = RoutingState.Failed("Dispositivo prioritario non disponibile")
+        if (!hasPreference) {
+            val state = RoutingState.Failed("Nessun dispositivo prioritario selezionato")
             _routingState.value = state
-            Logger.w("Preferred Bluetooth device is not currently available")
+            Logger.w("Routing refused: no priority Bluetooth device is configured")
             return state
         }
 
-        return routeToFirstAvailableBluetooth()
+        val target = findPreferredBluetoothCommunicationDevice(address, name)
+        if (target != null) return routeToBluetooth(target)
+
+        val state = RoutingState.Failed("Dispositivo prioritario non connesso")
+        _routingState.value = state
+        Logger.w("Preferred Bluetooth device is not currently available")
+        return state
+    }
+
+    fun isPreferredBluetoothAvailable(address: String?, name: String?): Boolean {
+        if (address.isNullOrBlank() && name.isNullOrBlank()) return false
+        return findPreferredBluetoothCommunicationDevice(address, name) != null
     }
 
     /**
@@ -415,7 +432,47 @@ class AudioRoutingManager(private val context: Context) {
         val communicationDevice = audioManager.communicationDevice
         val hasPreference = !preferredAddress.isNullOrBlank() || !preferredName.isNullOrBlank()
 
-        if (hasPreference && !deviceMatchesPreference(communicationDevice, preferredAddress, preferredName)) {
+        if (!hasPreference) {
+            _micLiveLevel.value = null
+            return@withContext publishMicTest(
+                MicTestResult(
+                    source = source,
+                    verdict = MicTestVerdict.TARGET_NOT_CONFIGURED,
+                    targetDeviceName = "Dispositivo Bluetooth",
+                    requestedInput = "N/D",
+                    actualInput = communicationDevice?.let(::deviceLabel) ?: "Nessun communication device",
+                    preferredDeviceAccepted = false,
+                    communicationDevice = currentCommunicationDeviceLabel(),
+                    peak = 0,
+                    rms = 0.0,
+                    samplesRead = 0,
+                    durationMs = 0,
+                    details = "SOURCE=${source.label} (${source.audioSource})\nVERDICT=TARGET_NOT_CONFIGURED\nSeleziona prima un dispositivo prioritario in Configurazione",
+                )
+            )
+        }
+
+        if (!isPreferredBluetoothAvailable(preferredAddress, preferredName)) {
+            _micLiveLevel.value = null
+            return@withContext publishMicTest(
+                MicTestResult(
+                    source = source,
+                    verdict = MicTestVerdict.TARGET_NOT_CONNECTED,
+                    targetDeviceName = configuredTargetName,
+                    requestedInput = configuredTargetName,
+                    actualInput = communicationDevice?.let(::deviceLabel) ?: "Nessun communication device",
+                    preferredDeviceAccepted = false,
+                    communicationDevice = currentCommunicationDeviceLabel(),
+                    peak = 0,
+                    rms = 0.0,
+                    samplesRead = 0,
+                    durationMs = 0,
+                    details = "SOURCE=${source.label} (${source.audioSource})\nVERDICT=TARGET_NOT_CONNECTED\nIl dispositivo prioritario non e presente tra i communication device Bluetooth disponibili",
+                )
+            )
+        }
+
+        if (!deviceMatchesPreference(communicationDevice, preferredAddress, preferredName)) {
             _micLiveLevel.value = null
             return@withContext publishMicTest(
                 MicTestResult(
@@ -688,12 +745,36 @@ class AudioRoutingManager(private val context: Context) {
         }
     }
 
+    fun clearMicDiagnostics() {
+        _lastMicTestResult.value = null
+        _micTestResults.value = emptyMap()
+        _micLiveLevel.value = null
+        Logger.i("Microphone diagnostic results cleared")
+    }
+
     private fun publishMicTest(result: MicTestResult): MicTestResult {
         _lastMicTestResult.value = result
         _micTestResults.value = _micTestResults.value.toMutableMap().apply {
             put(result.source, result)
         }
         return result
+    }
+
+    private fun syncRoutingStateWithSystem() {
+        val systemDevice = audioManager.communicationDevice
+        if (systemDevice != null && isBluetoothMicType(systemDevice.type)) {
+            currentRoutedDevice = systemDevice
+            if (_routingState.value is RoutingState.Active || _routingState.value is RoutingState.Routing) {
+                val name = systemDevice.productName?.toString() ?: "Dispositivo Bluetooth"
+                _routingState.value = RoutingState.Active(name)
+            }
+        } else {
+            currentRoutedDevice = null
+            if (_routingState.value is RoutingState.Active) {
+                _routingState.value = RoutingState.Idle
+                Logger.i("System communication route is no longer Bluetooth; state reset to Idle")
+            }
+        }
     }
 
     private fun refreshAvailableDevices() {

@@ -30,12 +30,15 @@ class BTCompanionService : CompanionDeviceService() {
 
     private lateinit var audioRoutingManager: AudioRoutingManager
     private lateinit var preferences: Preferences
+    private lateinit var companionManager: DeviceCompanionManager
 
     override fun onCreate() {
         super.onCreate()
         Logger.i("BTCompanionService created")
         audioRoutingManager = AudioRoutingManager(applicationContext)
         preferences = Preferences(applicationContext)
+        companionManager = DeviceCompanionManager(applicationContext)
+        companionManager.reconcilePriority()
     }
 
     /**
@@ -56,9 +59,10 @@ class BTCompanionService : CompanionDeviceService() {
 
         // Apply the audio routing fix ONLY to the selected priority device.
         audioRoutingManager.startMonitoring()
+        val priority = companionManager.getPriorityDevice()
         val result = audioRoutingManager.routeToPreferredBluetooth(
-            preferences.pairedDeviceAddress,
-            preferences.pairedDeviceName,
+            priority?.address,
+            priority?.name,
         )
 
         when (result) {
@@ -96,9 +100,10 @@ class BTCompanionService : CompanionDeviceService() {
     }
 
     private fun isPriorityAssociation(info: AssociationInfo): Boolean {
-        return preferences.isPreferredDevice(
-            info.deviceMacAddress?.toString(),
-            info.displayName?.toString(),
+        companionManager.reconcilePriority()
+        return preferences.isPreferredAssociation(
+            associationId = info.id,
+            address = info.deviceMacAddress?.toString(),
         )
     }
 

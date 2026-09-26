@@ -1,3 +1,16 @@
+# 0.5.3-aa-stable-identity
+
+- Riscritta la gestione del dispositivo prioritario: identita basata su Association ID / MAC, mai sul nome visualizzato.
+- Il nome del dispositivo viene risolto live da Android Bluetooth (alias/nome) quando CDM mostra solo il MAC.
+- Rimossa l'adozione automatica di una vecchia associazione rimasta sola.
+- Le preferenze stale vengono eliminate se l'associazione prioritaria non esiste piu.
+- Aggiunto "Azzera associazioni BTMicFix" senza rimuovere i pairing Bluetooth del telefono.
+- Cambio/rimozione/reset del dispositivo puliscono routing, policy Shizuku e risultati diagnostici vecchi.
+- "Attiva", "Forza", "Lock" e TEST non sono piu eseguibili se il dispositivo prioritario non e realmente disponibile.
+- Il routing non cade piu sul primo dispositivo Bluetooth quando non esiste una priorita esplicita.
+- I test distinguono: nessun target configurato, target non connesso, route reale diversa.
+- Eliminati i risultati Shizuku/test obsoleti quando cambia target.
+
 # BTMicFix W622 / Android Auto changes
 
 ## 0.5.2-aa-generic-device

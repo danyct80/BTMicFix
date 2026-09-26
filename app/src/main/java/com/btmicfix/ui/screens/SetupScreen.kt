@@ -29,7 +29,6 @@ import com.btmicfix.companion.DeviceCompanionManager
 import com.btmicfix.shizuku.ShizukuManager
 import com.btmicfix.shizuku.ShizukuManager.ShizukuStatus
 import com.btmicfix.ui.theme.*
-import com.btmicfix.util.Preferences
 
 /**
  * Step-by-step setup wizard that guides the user through:
@@ -44,7 +43,6 @@ fun SetupScreen(
     audioRoutingManager: AudioRoutingManager,
     shizukuManager: ShizukuManager,
     companionManager: DeviceCompanionManager,
-    preferences: Preferences,
     onBackClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -203,15 +201,35 @@ fun SetupScreen(
                 devices = associatedDevices,
                 onAssociate = {
                     companionManager.startAssociation(cdmLauncher) {
+                        audioRoutingManager.clearRouting()
+                        shizukuManager.clearForcedBluetoothSco()
+                        shizukuManager.clearLastForceResult()
+                        audioRoutingManager.clearMicDiagnostics()
                         refreshAssociatedDevices()
                     }
                 },
                 onMakePriority = { associationId ->
+                    audioRoutingManager.clearRouting()
+                    shizukuManager.clearForcedBluetoothSco()
+                    shizukuManager.clearLastForceResult()
+                    audioRoutingManager.clearMicDiagnostics()
                     companionManager.makeExclusivePriority(associationId)
                     refreshAssociatedDevices()
                 },
                 onRemove = { associationId ->
+                    audioRoutingManager.clearRouting()
+                    shizukuManager.clearForcedBluetoothSco()
+                    shizukuManager.clearLastForceResult()
+                    audioRoutingManager.clearMicDiagnostics()
                     companionManager.removeAssociation(associationId)
+                    refreshAssociatedDevices()
+                },
+                onReset = {
+                    audioRoutingManager.clearRouting()
+                    shizukuManager.clearForcedBluetoothSco()
+                    shizukuManager.clearLastForceResult()
+                    audioRoutingManager.clearMicDiagnostics()
+                    companionManager.resetAssociationsAndPriority()
                     refreshAssociatedDevices()
                 },
             )
@@ -238,9 +256,10 @@ fun SetupScreen(
                     if (routingState is AudioRoutingManager.RoutingState.Active) {
                         audioRoutingManager.clearRouting()
                     } else {
+                        val priority = companionManager.getPriorityDevice()
                         audioRoutingManager.routeToPreferredBluetooth(
-                            preferences.pairedDeviceAddress,
-                            preferences.pairedDeviceName,
+                            priority?.address,
+                            priority?.name,
                         )
                     }
                 },
@@ -257,6 +276,7 @@ private fun DeviceAssociationCard(
     onAssociate: () -> Unit,
     onMakePriority: (Int) -> Unit,
     onRemove: (Int) -> Unit,
+    onReset: () -> Unit,
 ) {
     val priority = devices.firstOrNull { it.isPriority }
 
@@ -352,6 +372,19 @@ private fun DeviceAssociationCard(
                     }
 
                     OutlinedButton(onClick = onAssociate) { Text("Associa nuovo") }
+                }
+
+                if (devices.isNotEmpty()) {
+                    TextButton(onClick = onReset) {
+                        Icon(Icons.Default.RestartAlt, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Azzera associazioni BTMicFix")
+                    }
+                    Text(
+                        "Rimuove solo le associazioni interne di BTMicFix: gli abbinamenti Bluetooth del telefono restano invariati.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
         }

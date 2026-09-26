@@ -14,8 +14,8 @@ android {
         applicationId = "com.btmicfix"
         minSdk = 31
         targetSdk = 34
-        versionCode = 7
-        versionName = "0.5.2-aa-generic-device"
+        versionCode = 8
+        versionName = "0.5.3-stable-identity"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
