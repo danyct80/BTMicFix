@@ -36,7 +36,9 @@ import com.btmicfix.ui.theme.*
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -71,6 +73,49 @@ fun HomeScreen(
     var diagnosticReport by remember(priorityAddress, priorityRoutingName) { mutableStateOf<String?>(null) }
     var diagnosticOk by remember(priorityAddress, priorityRoutingName) { mutableStateOf<Boolean?>(null) }
     var pendingDiagnostic by remember { mutableStateOf(false) }
+    var routeHoldRequested by remember { mutableStateOf(false) }
+    var routeHoldJob by remember { mutableStateOf<Job?>(null) }
+
+    fun startRouteHold() {
+        if (priority == null) return
+        routeHoldRequested = true
+        routeHoldJob?.cancel()
+        routeHoldJob = scope.launch {
+            while (isActive && routeHoldRequested) {
+                if (audioRoutingManager.isPreferredBluetoothAvailable(
+                        priorityAddress,
+                        priorityRoutingName,
+                    )
+                ) {
+                    withContext(Dispatchers.IO) {
+                        audioRoutingManager.routeToPreferredBluetoothAndWait(
+                            priorityAddress,
+                            priorityRoutingName,
+                            timeoutMs = 2_500L,
+                        )
+                    }
+                }
+                delay(750L)
+            }
+        }
+    }
+
+    fun stopRouteHold(clearRoute: Boolean) {
+        routeHoldRequested = false
+        routeHoldJob?.cancel()
+        routeHoldJob = null
+        if (clearRoute) {
+            audioRoutingManager.clearRoutingIfPreferred(priorityAddress, priorityRoutingName)
+        }
+    }
+
+    DisposableEffect(priorityAddress, priorityRoutingName) {
+        onDispose {
+            routeHoldRequested = false
+            routeHoldJob?.cancel()
+            routeHoldJob = null
+        }
+    }
 
     fun launchCompleteDiagnostic() {
         if (diagnosticRunning) return
@@ -83,6 +128,8 @@ fun HomeScreen(
         scope.launch {
             val lines = mutableListOf<String>()
             var failures = 0
+            val holdWasAlreadyRequested = routeHoldRequested
+            if (!holdWasAlreadyRequested) startRouteHold()
             try {
                 lines += "Target: $priorityDisplayName"
 
@@ -139,7 +186,8 @@ fun HomeScreen(
                         )
                         var step = 2
                         for (source in sources) {
-                            diagnosticStep = "$step/9 ${source.label} — route attiva"
+                            diagnosticStep = "$step/9 ${source.label} — preparati: prima SILENZIO, poi PARLA"
+                            delay(1_000L)
                             val natural = withContext(Dispatchers.IO) {
                                 audioRoutingManager.testBluetoothMicrophone(
                                     source = source,
@@ -153,7 +201,8 @@ fun HomeScreen(
                             lines += "${source.label} / ROUTE_ATTIVA: ${natural.verdict} — ${natural.actualInput} — RMS ${"%.0f".format(natural.rms)}"
                             step++
 
-                            diagnosticStep = "$step/9 ${source.label} — target esplicito"
+                            diagnosticStep = "$step/9 ${source.label} target esplicito — preparati: prima SILENZIO, poi PARLA"
+                            delay(1_000L)
                             val explicit = withContext(Dispatchers.IO) {
                                 audioRoutingManager.testBluetoothMicrophone(
                                     source = source,
@@ -195,12 +244,13 @@ fun HomeScreen(
                             if (!forceOk || !routeStillActiveAfterForce) failures++
 
                             if (forceOk && routeStillActiveAfterForce) {
-                                // Give AudioPolicy a brief settling window after the verified force.
-                                delay(250L)
+                                // Give AudioPolicy a settling window and the user time to prepare.
+                                diagnosticStep = "8/9 Shizuku — preparati: prima SILENZIO, poi PARLA"
+                                delay(1_000L)
                                 val forcedMic = withContext(Dispatchers.IO) {
                                     audioRoutingManager.testBluetoothMicrophone(
                                         source = MicTestSource.VOICE_RECOGNITION,
-                                        durationMs = 3_500L,
+                                        durationMs = 7_000L,
                                         preferredAddress = priorityAddress,
                                         preferredName = priorityRoutingName,
                                         targetDisplayName = priorityDisplayName,
@@ -249,6 +299,9 @@ fun HomeScreen(
                     withContext(NonCancellable + Dispatchers.IO) {
                         shizukuManager.clearForcedBluetoothScoIfApplied()
                     }
+                }
+                if (!holdWasAlreadyRequested) {
+                    stopRouteHold(clearRoute = false)
                 }
                 diagnosticRunning = false
                 diagnosticStep = null
@@ -308,28 +361,25 @@ fun HomeScreen(
             StatusCard(routingState)
 
             Button(
-                onClick = {
-                    scope.launch {
-                        audioRoutingManager.routeToPreferredBluetoothAndWait(
-                            priorityAddress,
-                            priorityRoutingName,
-                        )
-                    }
-                },
-                enabled = priorityAvailable && !diagnosticRunning &&
+                onClick = { startRouteHold() },
+                enabled = priorityAvailable && !diagnosticRunning && !routeHoldRequested &&
                     routingState !is RoutingState.Routing,
                 modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = Purple40),
             ) {
                 Icon(Icons.Default.PowerSettingsNew, null)
                 Spacer(modifier = Modifier.width(8.dp))
-                Text(if (priorityAvailable) "Attiva $priorityDisplayName" else "Dispositivo prioritario non disponibile")
+                Text(
+                    if (!priorityAvailable) "Dispositivo prioritario non disponibile"
+                    else if (routeHoldRequested) "Instradamento mantenuto su $priorityDisplayName"
+                    else "Attiva $priorityDisplayName"
+                )
             }
 
-            if (routingState is RoutingState.Active) {
+            if (routingState is RoutingState.Active || routeHoldRequested) {
                 OutlinedButton(
                     onClick = {
-                        audioRoutingManager.clearRoutingIfPreferred(priorityAddress, priorityRoutingName)
+                        stopRouteHold(clearRoute = true)
                         shizukuManager.clearForcedBluetoothScoIfApplied()
                     },
                     enabled = !diagnosticRunning,

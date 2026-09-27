@@ -450,7 +450,7 @@ class AudioRoutingManager(private val context: Context) {
 
     suspend fun testBluetoothMicrophone(
         source: MicTestSource,
-        durationMs: Long = 4_500L,
+        durationMs: Long = 7_000L,
         preferredAddress: String? = null,
         preferredName: String? = null,
         targetDisplayName: String? = null,
@@ -599,6 +599,7 @@ class AudioRoutingManager(private val context: Context) {
         var speechPeak = 0
         var totalSamples = 0L
         var readErrors = 0
+        var communicationRouteLostDuringCapture = false
         val startMs = SystemClock.elapsedRealtime()
         val baselineEndMs = startMs + MIC_BASELINE_MS.coerceAtMost(durationMs / 2)
         val endMs = startMs + durationMs.coerceAtLeast(MIC_BASELINE_MS + 1_000L)
@@ -627,6 +628,14 @@ class AudioRoutingManager(private val context: Context) {
             while (SystemClock.elapsedRealtime() < endMs) {
                 currentCoroutineContext().ensureActive()
                 observeRoutedDevice()
+                if (!deviceMatchesPreference(
+                        audioManager.communicationDevice,
+                        preferredAddress,
+                        preferredName,
+                    )
+                ) {
+                    communicationRouteLostDuringCapture = true
+                }
                 val read = recorder.read(pcm, 0, pcm.size, AudioRecord.READ_NON_BLOCKING)
                 if (read == 0) {
                     Thread.sleep(10)
@@ -714,11 +723,13 @@ class AudioRoutingManager(private val context: Context) {
             actualInput = actualInput,
             requestedInput = requestedInput,
             preferredAddress = preferredAddress,
+            preferredName = preferredName,
         )
         val verdict = when {
             readErrors >= 3 -> MicTestVerdict.ERROR
             actualInput == null -> MicTestVerdict.INDETERMINATE
             routeSwitchedDuringCapture -> MicTestVerdict.INDETERMINATE
+            communicationRouteLostDuringCapture -> MicTestVerdict.INDETERMINATE
             !isBluetoothMicDevice(actualInput!!) -> MicTestVerdict.WRONG_DEVICE
             definitelyWrongDevice -> MicTestVerdict.WRONG_DEVICE
             !routeMatch -> MicTestVerdict.INDETERMINATE
@@ -776,6 +787,7 @@ class AudioRoutingManager(private val context: Context) {
                     appendLine("Actual routed input: ${actualInput?.let(::deviceLabel) ?: "N/D"}")
                     appendLine("Observed routed inputs: ${observedRoutedDeviceLabels.joinToString(" | ").ifBlank { "N/D" }}")
                     appendLine("Route switched during capture: $routeSwitchedDuringCapture")
+                    appendLine("Communication route left target during capture: $communicationRouteLostDuringCapture")
                     appendLine("Route match: $routeMatch")
                     appendLine("Baseline RMS=${"%.1f".format(baselineRms)} peak=$baselinePeak")
                     appendLine("Speech RMS=${"%.1f".format(speechRms)} peak=$speechPeak")
@@ -836,25 +848,47 @@ class AudioRoutingManager(private val context: Context) {
         actualInput: AudioDeviceInfo?,
         requestedInput: AudioDeviceInfo?,
         preferredAddress: String?,
+        preferredName: String?,
     ): Boolean {
         if (actualInput == null) return false
         if (!isBluetoothMicDevice(actualInput)) return true
 
-        // A MAC/address contradiction is strong evidence. Friendly-name differences are NOT:
-        // OEM AudioDeviceInfo.productName may expose a model name while BluetoothDevice.alias
-        // exposes the user-renamed label. Treat name-only mismatches as INDETERMINATE instead
-        // of falsely declaring another physical device.
-        if (!preferredAddress.isNullOrBlank() && actualInput.address.isNotBlank()) {
-            return !actualInput.address.equals(preferredAddress, ignoreCase = true)
+        val actualName = actualInput.productName?.toString()?.trim()
+            ?.takeIf { it.isNotBlank() && !looksLikeMac(it) }
+        val requestedName = requestedInput?.productName?.toString()?.trim()
+            ?.takeIf { it.isNotBlank() && !looksLikeMac(it) }
+        val normalizedPreferredName = preferredName?.trim()
+            ?.takeIf { it.isNotBlank() && !looksLikeMac(it) }
+
+        // Bluetooth communication output and microphone input are different AudioDeviceInfo
+        // endpoints. OEMs may expose different ids AND different/masked addresses for the two
+        // endpoints of the same headset. Therefore an address mismatch alone is NOT proof of a
+        // different physical device. An exact friendly-name match is stronger evidence here.
+        if (normalizedPreferredName != null &&
+            actualName?.equals(normalizedPreferredName, ignoreCase = true) == true
+        ) return false
+        if (requestedName != null && actualName?.equals(requestedName, ignoreCase = true) == true) {
+            return false
         }
 
-        if (requestedInput != null && requestedInput.address.isNotBlank() &&
-            actualInput.address.isNotBlank()
-        ) {
-            return !actualInput.address.equals(requestedInput.address, ignoreCase = true)
+        // Only call it definitely wrong when two independent identity hints disagree: both
+        // endpoints expose non-empty addresses that differ AND both expose usable names that
+        // also differ. Otherwise the safe verdict is INDETERMINATE, never WRONG_DEVICE.
+        val addressContradiction = when {
+            !preferredAddress.isNullOrBlank() && actualInput.address.isNotBlank() ->
+                !actualInput.address.equals(preferredAddress, ignoreCase = true)
+            requestedInput != null && requestedInput.address.isNotBlank() && actualInput.address.isNotBlank() ->
+                !actualInput.address.equals(requestedInput.address, ignoreCase = true)
+            else -> false
         }
-
-        return false
+        val nameContradiction = when {
+            normalizedPreferredName != null && actualName != null ->
+                !actualName.equals(normalizedPreferredName, ignoreCase = true)
+            requestedName != null && actualName != null ->
+                !actualName.equals(requestedName, ignoreCase = true)
+            else -> false
+        }
+        return addressContradiction && nameContradiction
     }
 
     private fun actualInputStronglyMatchesTarget(
@@ -876,6 +910,10 @@ class AudioRoutingManager(private val context: Context) {
             actualInput.productName?.toString()?.trim()
                 ?.equals(normalizedPreferredName, ignoreCase = true) == true
         ) {
+            // Input/output ids are expected to differ. For a user-visible Bluetooth alias that
+            // exactly matches the selected priority target, accept the input even if the OEM
+            // exposes a different endpoint address. If duplicate BT inputs share the same name,
+            // fall through to stronger requested-input evidence instead.
             val matches = bluetoothInputs.count { input ->
                 input.productName?.toString()?.trim()
                     ?.equals(normalizedPreferredName, ignoreCase = true) == true
@@ -978,7 +1016,7 @@ class AudioRoutingManager(private val context: Context) {
         @Volatile private var savedAudioModeBeforeRouting: Int? = null
         private val routingMutex = Mutex()
 
-        private const val MIC_BASELINE_MS = 1_200L
+        private const val MIC_BASELINE_MS = 2_500L
         private const val BASELINE_RMS_MULTIPLIER = 3.0
         private const val BASELINE_PEAK_MULTIPLIER = 1.8
         private const val MIN_VOICE_RMS = 250.0

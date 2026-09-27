@@ -29,6 +29,7 @@ class BTCompanionService : CompanionDeviceService() {
     private lateinit var preferences: Preferences
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var routingJob: Job? = null
+    private var disappearanceJob: Job? = null
 
     private var activeAssociationId: Int? = null
     private var activeAddress: String? = null
@@ -54,6 +55,8 @@ class BTCompanionService : CompanionDeviceService() {
             return
         }
 
+        disappearanceJob?.cancel()
+        disappearanceJob = null
         val priority = companionManager.getPriorityDevice() ?: return
         activeAssociationId = associationInfo.id
         activeAddress = priority.address
@@ -98,22 +101,37 @@ class BTCompanionService : CompanionDeviceService() {
             return
         }
 
-        routingJob?.cancel()
-        routingJob = null
-        val clearAddress = if (wasActive) activeAddress else associationInfo.deviceMacAddress?.toString()
-        val clearName = if (wasActive) activeRoutingName else companionManager.getPriorityDevice()?.routingName
-        audioRoutingManager.clearRoutingIfPreferred(clearAddress, clearName)
-        audioRoutingManager.stopMonitoring()
-        activeAssociationId = null
-        activeAddress = null
-        activeRoutingName = null
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        disappearanceJob?.cancel()
+        disappearanceJob = serviceScope.launch {
+            // Companion presence can flap briefly while Bluetooth profiles/SCO are changing.
+            // Give Android a short grace window and verify the REAL audio state before treating
+            // this as a physical disappearance. Never clear a still-valid route from this callback.
+            delay(2_000L)
+            val checkAddress = if (wasActive) activeAddress else associationInfo.deviceMacAddress?.toString()
+            val checkName = if (wasActive) activeRoutingName else companionManager.getPriorityDevice()?.routingName
+            val stillPresent = audioRoutingManager.isPreferredBluetoothAvailable(checkAddress, checkName) ||
+                audioRoutingManager.isPreferredCommunicationDeviceActive(checkAddress, checkName)
+            if (stillPresent) {
+                Logger.i("Ignoring transient companion disappearance for association ${associationInfo.id}")
+                return@launch
+            }
+
+            routingJob?.cancel()
+            routingJob = null
+            audioRoutingManager.stopMonitoring()
+            activeAssociationId = null
+            activeAddress = null
+            activeRoutingName = null
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
     }
 
     override fun onDestroy() {
         routingJob?.cancel()
         routingJob = null
+        disappearanceJob?.cancel()
+        disappearanceJob = null
         serviceScope.cancel()
         audioRoutingManager.stopMonitoring()
         activeAssociationId = null

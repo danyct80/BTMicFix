@@ -128,8 +128,10 @@ class MainActivity : ComponentActivity(), BluetoothStateReceiver.BluetoothConnec
         // routeToPreferredBluetoothAndWait() performs its own cancellation cleanup.
         foregroundRoutingJob?.cancel()
         foregroundRoutingJob = null
-        val priority = companionManager.getPriorityDevice()
-        audioRoutingManager.clearRoutingIfPreferred(priority?.address, priority?.routingName)
+        // Do not call clearCommunicationDevice() from an ACL-disconnect broadcast. Android
+        // automatically removes a communication-device selection when the device truly
+        // disconnects; explicitly clearing here can tear down a still-valid SCO route on
+        // transient/OEM Bluetooth profile events.
     }
 
     private enum class Screen { Home, Setup, Details }
