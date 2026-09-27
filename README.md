@@ -1,4 +1,4 @@
-# BTMicFix 0.9.0 — Passive Observer
+# BTMicFix 0.9.1 — Passive Observer
 
 This branch is intentionally diagnostic-only. It does **not** route, capture, force or exclude audio.
 
