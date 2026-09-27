@@ -14,8 +14,8 @@ android {
         applicationId = "com.btmicfix"
         minSdk = 33
         targetSdk = 34
-        versionCode = 19
-        versionName = "0.8.0-inverse-exclusion-probe"
+        versionCode = 20
+        versionName = "0.9.0-passive-observer"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

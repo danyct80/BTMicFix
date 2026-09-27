@@ -1,74 +1,28 @@
-# BTMicFix 0.7.0 — Logic Core
+# BTMicFix 0.9.0 — Passive Observer
 
-BTMicFix is an Android utility for selecting one explicit Bluetooth communication device and verifying the real microphone input used by Android.
+This branch is intentionally diagnostic-only. It does **not** route, capture, force or exclude audio.
 
-## Routing architecture in 0.7.0
+## What the 20-second probe does
 
-The 0.7 branch changes the routing model completely:
+- 0–3 s: baseline, do nothing.
+- 3–15 s: press the Cardo voice button and speak to Gemini normally while Android Auto is active.
+- 15–20 s: release everything and wait.
 
-- one process-wide `AudioRoutingManager` is shared by the Activity and CompanionDeviceService;
-- BTMicFix places **one** `AudioManager.setCommunicationDevice()` request;
-- BTMicFix **never calls `AudioManager.setMode()`**;
-- there is **no route-hold loop**, timer reassertion, or routing reaction to audio-mode changes;
-- phone calls, VoIP apps and voice assistants are allowed to take temporary priority;
-- when another audio owner takes the communication route, BTMicFix reports `Yielded` and does nothing;
-- when Android gives the route back, BTMicFix observes it and returns to `Active` without another request;
-- explicit disable/configuration changes are the only normal operations that call `clearCommunicationDevice()`;
-- a physical target disconnect clears only BTMicFix's logical request state after a debounced Companion Device callback.
+During the window the app only reads/listens to:
 
-This follows Android's communication-device arbitration model: simultaneous requests are prioritized by the application controlling the audio mode. BTMicFix intentionally does not try to become that owner.
+- `AudioManager.mode`
+- current and available communication devices
+- all visible audio input/output devices
+- active recording configurations (`source`, effective source, device, silenced state, formats)
+- audio-device, recording, communication-device and mode callbacks
+- current Wi-Fi/cellular/network transports
+- Bluetooth profile connection states (when BLUETOOTH_CONNECT is granted)
+- optional **read-only** Shizuku snapshots from `dumpsys audio`, `dumpsys media.audio_policy` and `dumpsys bluetooth_manager`
 
-## Logic tests
+It never opens `AudioRecord`, never requests `RECORD_AUDIO`, never calls `setCommunicationDevice`, never changes `AudioManager.mode`, never requests audio focus and never changes AudioPolicy.
 
-`RoutingPolicy` is a pure Kotlin policy layer with unit tests for:
+## Safety / logic gate
 
-- one-shot user activation;
-- auto-route only on device appearance/app resume;
-- no reassertion after communication-device changes;
-- no reassertion after audio-mode changes;
-- no timer-based route hold;
-- assistant/phone takeover represented as `Yielded`;
-- route return represented as `Active` without issuing another request;
-- auto-route disabled behavior;
-- disconnected-target behavior.
+`tools/audit_passive.sh` fails CI if a mutating/capturing audio API or the old routing/companion architecture reappears. GitHub Actions runs this audit before unit tests and APK compilation.
 
-GitHub Actions runs `testDebugUnitTest` before building the APK.
-
-## Unified microphone diagnostic
-
-The complete diagnostic performs:
-
-- one-shot route request if no request already exists;
-- real `VOICE_COMMUNICATION`, `VOICE_RECOGNITION`, and `MIC` captures;
-- each source once using the active Android route and once with `AudioRecord.setPreferredDevice()`;
-- verification of `AudioRecord.routedDevice` while recording;
-- real PCM RMS/peak analysis with silence calibration and conservative identity checks;
-- optional Shizuku force-use diagnostic isolated from normal routing;
-- guaranteed Shizuku cleanup;
-- restoration of the pre-diagnostic BTMicFix request state.
-
-Shizuku is **never used by normal routing**.
-
-## Requirements
-
-- Android 13+ (API 33+)
-- Bluetooth communication device paired with the phone
-- `BLUETOOTH_CONNECT`
-- `RECORD_AUDIO` for diagnostics
-- Shizuku only for optional privileged diagnostics
-
-## Build
-
-GitHub Actions uses JDK 17 and runs:
-
-```bash
-./gradlew testDebugUnitTest --stacktrace
-./gradlew assembleDebug --stacktrace
-```
-
-Build output is under `app/build_tmp/`.
-
-
-## 0.8.0 - Inverse Exclusion Probe
-
-Adds a temporary Shizuku diagnostic that does the opposite of positive routing: it attempts to mark a selected head unit DEVICE_ROLE_DISABLED only for AudioProductStrategy entries matching VOICE_COMMUNICATION and ASSISTANT. The test never targets media strategies, snapshots any pre-existing disabled-role lists, runs for 20 seconds, and restores the exact previous policy in finally.
+After the run, use **COPIA REPORT COMPLETO** and paste the report into the ChatGPT conversation.

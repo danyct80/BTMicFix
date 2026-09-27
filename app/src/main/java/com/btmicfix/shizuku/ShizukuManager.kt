@@ -14,23 +14,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import rikka.shizuku.Shizuku
 
-/** Optional Shizuku integration. Core routing does not depend on it. */
+/** Read-only Shizuku bridge for passive diagnostics. */
 class ShizukuManager {
 
-    enum class ShizukuStatus {
-        UNKNOWN,
-        NOT_INSTALLED,
-        NOT_RUNNING,
-        PERMISSION_NEEDED,
-        READY,
-    }
-
-    enum class UserServiceState {
-        DISCONNECTED,
-        CONNECTING,
-        READY,
-        ERROR,
-    }
+    enum class ShizukuStatus { UNKNOWN, NOT_INSTALLED, NOT_RUNNING, PERMISSION_NEEDED, READY }
+    enum class UserServiceState { DISCONNECTED, CONNECTING, READY, ERROR }
 
     private val _status = MutableStateFlow(ShizukuStatus.UNKNOWN)
     val status: StateFlow<ShizukuStatus> = _status.asStateFlow()
@@ -38,15 +26,8 @@ class ShizukuManager {
     private val _serviceState = MutableStateFlow(UserServiceState.DISCONNECTED)
     val serviceState: StateFlow<UserServiceState> = _serviceState.asStateFlow()
 
-    private val _lastForceResult = MutableStateFlow<String?>(null)
-    val lastForceResult: StateFlow<String?> = _lastForceResult.asStateFlow()
-
-    private val _lastExclusionResult = MutableStateFlow<String?>(null)
-    val lastExclusionResult: StateFlow<String?> = _lastExclusionResult.asStateFlow()
-
-    private var privilegedService: IPrivilegedService? = null
-    private var bindingRequested = false
-    @Volatile private var forcedScoApplied = false
+    @Volatile private var privilegedService: IPrivilegedService? = null
+    @Volatile private var bindingRequested = false
 
     private val binderReceivedListener = Shizuku.OnBinderReceivedListener {
         refreshStatus()
@@ -84,7 +65,6 @@ class ShizukuManager {
     }
 
     fun cleanup() {
-        clearForcedBluetoothScoIfApplied()
         try {
             Shizuku.removeBinderReceivedListener(binderReceivedListener)
             Shizuku.removeBinderDeadListener(binderDeadListener)
@@ -108,16 +88,13 @@ class ShizukuManager {
             Logger.e("Error checking Shizuku", e)
             ShizukuStatus.NOT_INSTALLED
         }
-
         if (_status.value == ShizukuStatus.READY && privilegedService == null) {
             bindPrivilegedService()
         }
     }
 
     fun requestPermission() {
-        if (_status.value == ShizukuStatus.NOT_RUNNING ||
-            _status.value == ShizukuStatus.NOT_INSTALLED
-        ) return
+        if (_status.value == ShizukuStatus.NOT_RUNNING || _status.value == ShizukuStatus.NOT_INSTALLED) return
         try {
             Shizuku.requestPermission(PERMISSION_REQUEST_CODE)
         } catch (e: Exception) {
@@ -128,12 +105,10 @@ class ShizukuManager {
     fun isAvailable(): Boolean = _status.value == ShizukuStatus.READY
     fun isServiceReady(): Boolean = _serviceState.value == UserServiceState.READY
 
-    /** Wait for the privileged UserService so diagnostics never start on an unknown force-use state. */
     suspend fun awaitServiceReady(timeoutMs: Long = 5_000L): Boolean {
         refreshStatus()
         if (!isAvailable()) return false
         if (isServiceReady() && privilegedService?.asBinder()?.pingBinder() == true) return true
-
         bindPrivilegedService()
         val deadline = SystemClock.elapsedRealtime() + timeoutMs.coerceAtLeast(250L)
         while (SystemClock.elapsedRealtime() < deadline) {
@@ -144,7 +119,21 @@ class ShizukuManager {
         return false
     }
 
-    fun bindPrivilegedService() {
+    fun collectPassiveSnapshot(label: String): String {
+        val service = privilegedService
+        if (service == null || !service.asBinder().pingBinder()) {
+            bindPrivilegedService()
+            return "SNAPSHOT_UNAVAILABLE: privileged service not ready"
+        }
+        return try {
+            service.collectPassiveSnapshot(label) ?: "SNAPSHOT_UNAVAILABLE: empty response"
+        } catch (e: Exception) {
+            _serviceState.value = UserServiceState.ERROR
+            "SNAPSHOT_ERROR: ${e.javaClass.simpleName}: ${e.message}"
+        }
+    }
+
+    private fun bindPrivilegedService() {
         if (!isAvailable() || privilegedService != null || bindingRequested) return
         val args = buildUserServiceArgs() ?: run {
             _serviceState.value = UserServiceState.ERROR
@@ -161,123 +150,16 @@ class ShizukuManager {
         }
     }
 
-    fun unbindPrivilegedService() {
+    private fun unbindPrivilegedService() {
         if (!bindingRequested && privilegedService == null) return
         try {
-            buildUserServiceArgs()?.let {
-                Shizuku.unbindUserService(it, userServiceConnection, true)
-            }
+            buildUserServiceArgs()?.let { Shizuku.unbindUserService(it, userServiceConnection, true) }
         } catch (_: Exception) {
         } finally {
             privilegedService = null
             bindingRequested = false
             _serviceState.value = UserServiceState.DISCONNECTED
         }
-    }
-
-    fun forceBluetoothSco(): String {
-        val service = privilegedService
-        if (service == null || !service.asBinder().pingBinder()) {
-            bindPrivilegedService()
-            return "RESULT=FAILED\nServizio privilegiato non connesso"
-        }
-        return try {
-            val result = service.forceBluetoothSco() ?: "RESULT=FAILED\nNessuna risposta"
-            forcedScoApplied = result.contains("RESULT=OK", ignoreCase = true) ||
-                result.contains("RESULT=FAILED_DIRTY", ignoreCase = true)
-            _lastForceResult.value = result
-            result
-        } catch (e: Exception) {
-            _serviceState.value = UserServiceState.ERROR
-            val result = "RESULT=FAILED\n${e.javaClass.simpleName}: ${e.message}"
-            _lastForceResult.value = result
-            result
-        }
-    }
-
-    fun clearForcedBluetoothSco(): String {
-        val service = privilegedService
-        if (service == null || !service.asBinder().pingBinder()) {
-            return "RESULT=CLEAR_FAILED\nServizio privilegiato non connesso"
-        }
-        return try {
-            val result = service.clearForcedBluetoothSco() ?: "RESULT=CLEAR_FAILED\nNessuna risposta"
-            if (result.contains("RESULT=CLEARED", ignoreCase = true)) {
-                forcedScoApplied = false
-            }
-            _lastForceResult.value = result
-            result
-        } catch (e: Exception) {
-            _serviceState.value = UserServiceState.ERROR
-            val result = "RESULT=CLEAR_FAILED\n${e.javaClass.simpleName}: ${e.message}"
-            _lastForceResult.value = result
-            result
-        }
-    }
-
-    fun clearForcedBluetoothScoIfApplied(): String {
-        if (!forcedScoApplied) return "Nessuna forzatura SCO attiva"
-        return clearForcedBluetoothSco()
-    }
-
-    fun isForcedBluetoothScoApplied(): Boolean = forcedScoApplied
-
-    fun inspectVoiceExclusionCapabilities(): String {
-        val service = privilegedService
-        if (service == null || !service.asBinder().pingBinder()) {
-            bindPrivilegedService()
-            return "RESULT=UNAVAILABLE\nServizio privilegiato non ancora connesso"
-        }
-        return try {
-            service.inspectVoiceExclusionCapabilities() ?: "RESULT=UNAVAILABLE\nNessuna risposta"
-        } catch (e: Exception) {
-            "RESULT=UNAVAILABLE\n${e.javaClass.simpleName}: ${e.message}"
-        }
-    }
-
-    fun testVoiceDeviceExclusion(
-        publicType: Int,
-        address: String,
-        name: String,
-        durationMs: Int = 20_000,
-    ): String {
-        val service = privilegedService
-        if (service == null || !service.asBinder().pingBinder()) {
-            bindPrivilegedService()
-            return "RESULT=UNAVAILABLE\nServizio privilegiato non ancora connesso"
-        }
-        return try {
-            val result = service.testVoiceDeviceExclusion(publicType, address, name, durationMs)
-                ?: "RESULT=UNAVAILABLE\nNessuna risposta"
-            _lastExclusionResult.value = result
-            result
-        } catch (e: Exception) {
-            val result = "RESULT=UNAVAILABLE\n${e.javaClass.simpleName}: ${e.message}"
-            _lastExclusionResult.value = result
-            result
-        }
-    }
-
-    fun getRoutingCapabilities(): String {
-        val service = privilegedService
-        if (service == null || !service.asBinder().pingBinder()) {
-            bindPrivilegedService()
-            return "Servizio privilegiato non ancora connesso"
-        }
-        return try {
-            service.routingCapabilities ?: "Nessuna risposta"
-        } catch (e: Exception) {
-            "ERRORE: ${e.javaClass.simpleName}: ${e.message}"
-        }
-    }
-
-    fun getAudioDiagnostics(): String? {
-        val service = privilegedService ?: return null
-        return try { service.audioDump } catch (_: Exception) { null }
-    }
-
-    fun clearLastForceResult() {
-        _lastForceResult.value = null
     }
 
     private val userServiceConnection = object : ServiceConnection {
