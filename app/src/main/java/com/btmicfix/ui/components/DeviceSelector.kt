@@ -14,13 +14,10 @@ import androidx.compose.ui.unit.dp
 import com.btmicfix.audio.AudioRoutingManager
 import com.btmicfix.ui.theme.*
 
-/**
- * Card showing available Bluetooth audio devices for manual selection.
- */
+/** Read-only list. Routing is controlled only by the priority device selected in Setup. */
 @Composable
 fun DeviceSelector(
     devices: List<AudioRoutingManager.BluetoothAudioDevice>,
-    onDeviceSelected: (AudioRoutingManager.BluetoothAudioDevice) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Card(
@@ -28,95 +25,39 @@ fun DeviceSelector(
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(containerColor = SurfaceCard),
     ) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-        ) {
-            Text(
-                text = "Dispositivi Bluetooth",
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onSurface,
-            )
-
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text("Dispositivi Bluetooth", style = MaterialTheme.typography.titleMedium)
             Spacer(modifier = Modifier.height(8.dp))
-
             if (devices.isEmpty()) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.LinkOff,
-                        contentDescription = null,
-                        tint = StatusIdle,
-                        modifier = Modifier.size(20.dp),
-                    )
-                    Spacer(modifier = Modifier.width(12.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.LinkOff, null, tint = StatusIdle)
+                    Spacer(modifier = Modifier.width(10.dp))
                     Text(
-                        text = "Nessun dispositivo audio Bluetooth connesso",
-                        style = MaterialTheme.typography.bodyMedium,
+                        "Nessun dispositivo di comunicazione Bluetooth disponibile",
+                        style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
             } else {
                 devices.forEach { device ->
-                    DeviceRow(
-                        device = device,
-                        onClick = { onDeviceSelected(device) },
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(Icons.Default.Headset, null, tint = Purple40)
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(device.name)
+                            Text(
+                                device.typeLabel,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Icon(Icons.Default.Bluetooth, "Disponibile", tint = Purple40)
+                    }
                 }
             }
-        }
-    }
-}
-
-@Composable
-private fun DeviceRow(
-    device: AudioRoutingManager.BluetoothAudioDevice,
-    onClick: () -> Unit,
-) {
-    TextButton(
-        onClick = onClick,
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(12.dp),
-        colors = ButtonDefaults.textButtonColors(
-            contentColor = MaterialTheme.colorScheme.onSurface,
-        ),
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Icon(
-                imageVector = Icons.Default.Headset,
-                contentDescription = null,
-                tint = Purple40,
-                modifier = Modifier.size(24.dp),
-            )
-
-            Spacer(modifier = Modifier.width(12.dp))
-
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = device.name,
-                    style = MaterialTheme.typography.bodyLarge,
-                )
-                Text(
-                    text = device.typeLabel,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-
-            Icon(
-                imageVector = Icons.Default.Bluetooth,
-                contentDescription = "Instrada verso il dispositivo",
-                tint = Purple40,
-                modifier = Modifier.size(20.dp),
-            )
         }
     }
 }

@@ -5,9 +5,11 @@
     <!-- Bluetooth permissions (Android 12+) -->
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
+    <!-- Real microphone diagnostics -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
     <!-- Audio routing -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <!-- Companion Device Manager background execution -->
     <uses-permission android:name="android.permission.REQUEST_COMPANION_RUN_IN_BACKGROUND" />

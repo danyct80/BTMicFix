@@ -10,9 +10,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BugReport
-import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PowerSettingsNew
-import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -22,20 +21,21 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.btmicfix.audio.AudioRoutingManager
+import com.btmicfix.audio.AudioRoutingManager.MicRouteMode
 import com.btmicfix.audio.AudioRoutingManager.MicTestPhase
+import com.btmicfix.audio.AudioRoutingManager.MicTestScenario
 import com.btmicfix.audio.AudioRoutingManager.MicTestSource
 import com.btmicfix.audio.AudioRoutingManager.MicTestVerdict
 import com.btmicfix.audio.AudioRoutingManager.RoutingState
 import com.btmicfix.companion.DeviceCompanionManager
 import com.btmicfix.shizuku.ShizukuManager
-import com.btmicfix.shizuku.ShizukuManager.ShizukuStatus
-import com.btmicfix.shizuku.ShizukuManager.UserServiceState
 import com.btmicfix.ui.components.DeviceSelector
 import com.btmicfix.ui.components.ShizukuStatusCard
 import com.btmicfix.ui.components.StatusCard
 import com.btmicfix.ui.theme.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -50,20 +50,229 @@ fun HomeScreen(
     onDetailsClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val routingState by audioRoutingManager.routingState.collectAsState()
     val availableDevices by audioRoutingManager.availableDevices.collectAsState()
+    val priority by companionManager.priorityDevice.collectAsState()
+    val liveLevel by audioRoutingManager.micLiveLevel.collectAsState()
     val shizukuStatus by shizukuManager.status.collectAsState()
-    val serviceState by shizukuManager.serviceState.collectAsState()
-    val micTestResults by audioRoutingManager.micTestResults.collectAsState()
-    val micLiveLevel by audioRoutingManager.micLiveLevel.collectAsState()
-    val priorityDevice = remember(availableDevices) { companionManager.getPriorityDevice() }
-    val preferredAddress = priorityDevice?.address
-    val preferredName = priorityDevice?.name
-    val preferredAvailable = audioRoutingManager.isPreferredBluetoothAvailable(preferredAddress, preferredName)
 
-    LaunchedEffect(preferredAddress, preferredName) {
+    val priorityAddress = priority?.address
+    val priorityRoutingName = priority?.routingName
+    val priorityDisplayName = priority?.name ?: "dispositivo prioritario"
+    val priorityAvailable = audioRoutingManager.isPreferredBluetoothAvailable(
+        priorityAddress,
+        priorityRoutingName,
+    )
+
+    var diagnosticRunning by remember { mutableStateOf(false) }
+    var diagnosticStep by remember { mutableStateOf<String?>(null) }
+    var diagnosticReport by remember(priorityAddress, priorityRoutingName) { mutableStateOf<String?>(null) }
+    var diagnosticOk by remember(priorityAddress, priorityRoutingName) { mutableStateOf<Boolean?>(null) }
+    var pendingDiagnostic by remember { mutableStateOf(false) }
+
+    fun launchCompleteDiagnostic() {
+        if (diagnosticRunning) return
+        diagnosticRunning = true
+        diagnosticStep = "Preparazione…"
+        diagnosticReport = null
+        diagnosticOk = null
         audioRoutingManager.clearMicDiagnostics()
-        shizukuManager.clearLastForceResult()
+
+        scope.launch {
+            val lines = mutableListOf<String>()
+            var failures = 0
+            try {
+                lines += "Target: $priorityDisplayName"
+
+                if (priority == null) {
+                    failures++
+                    lines += "Target: FAIL — nessun dispositivo prioritario"
+                } else {
+                    if (shizukuStatus == ShizukuManager.ShizukuStatus.READY) {
+                        val privilegedReady = withContext(Dispatchers.IO) {
+                            shizukuManager.awaitServiceReady()
+                        }
+                        if (!privilegedReady) {
+                            failures++
+                            lines += "Shizuku pre-clean: FAIL — servizio privilegiato non disponibile"
+                            throw IllegalStateException(
+                                "Shizuku e autorizzato ma il servizio privilegiato non e pronto: baseline non garantita"
+                            )
+                        }
+                        val preClear = withContext(Dispatchers.IO) {
+                            shizukuManager.clearForcedBluetoothSco()
+                        }
+                        if (!preClear.contains("RESULT=CLEARED", ignoreCase = true)) {
+                            failures++
+                            lines += "Shizuku pre-clean: FAIL — impossibile garantire una baseline pulita"
+                            throw IllegalStateException(
+                                "Policy Shizuku non ripristinabile: test audio annullati per evitare risultati contaminati"
+                            )
+                        }
+                    }
+
+                    diagnosticStep = "1/9 Attivazione routing reale"
+                    val routed = withContext(Dispatchers.IO) {
+                        audioRoutingManager.routeToPreferredBluetoothAndWait(
+                            priorityAddress,
+                            priorityRoutingName,
+                        )
+                    }
+                    val active = audioRoutingManager.isPreferredCommunicationDeviceActive(
+                        priorityAddress,
+                        priorityRoutingName,
+                    )
+                    if (routed is RoutingState.Active && active) {
+                        lines += "Routing: PASS — ${audioRoutingManager.currentCommunicationDeviceLabel()}"
+                    } else {
+                        failures++
+                        lines += "Routing: FAIL — ${(routed as? RoutingState.Failed)?.reason ?: "route non confermata"}"
+                    }
+
+                    if (active) {
+                        val sources = listOf(
+                            MicTestSource.VOICE_COMMUNICATION,
+                            MicTestSource.VOICE_RECOGNITION,
+                            MicTestSource.MIC,
+                        )
+                        var step = 2
+                        for (source in sources) {
+                            diagnosticStep = "$step/9 ${source.label} — route attiva"
+                            val natural = withContext(Dispatchers.IO) {
+                                audioRoutingManager.testBluetoothMicrophone(
+                                    source = source,
+                                    preferredAddress = priorityAddress,
+                                    preferredName = priorityRoutingName,
+                                    targetDisplayName = priorityDisplayName,
+                                    routeMode = MicRouteMode.SYSTEM_DEFAULT,
+                                )
+                            }
+                            if (natural.verdict != MicTestVerdict.PASS) failures++
+                            lines += "${source.label} / ROUTE_ATTIVA: ${natural.verdict} — ${natural.actualInput} — RMS ${"%.0f".format(natural.rms)}"
+                            step++
+
+                            diagnosticStep = "$step/9 ${source.label} — target esplicito"
+                            val explicit = withContext(Dispatchers.IO) {
+                                audioRoutingManager.testBluetoothMicrophone(
+                                    source = source,
+                                    preferredAddress = priorityAddress,
+                                    preferredName = priorityRoutingName,
+                                    targetDisplayName = priorityDisplayName,
+                                    routeMode = MicRouteMode.TARGET_PREFERRED,
+                                )
+                            }
+                            if (explicit.verdict != MicTestVerdict.PASS) failures++
+                            lines += "${source.label} / TARGET_ESPLICITO: ${explicit.verdict} — ${explicit.actualInput} — RMS ${"%.0f".format(explicit.rms)}"
+                            step++
+                        }
+                    }
+
+                    diagnosticStep = "8/9 Shizuku force + prova microfono reale"
+                    val shizukuReady = shizukuStatus == ShizukuManager.ShizukuStatus.READY &&
+                        withContext(Dispatchers.IO) { shizukuManager.awaitServiceReady(3_000L) }
+                    val targetStillActive = audioRoutingManager.isPreferredCommunicationDeviceActive(
+                        priorityAddress,
+                        priorityRoutingName,
+                    )
+                    if (shizukuReady && targetStillActive) {
+                        val preClear = withContext(Dispatchers.IO) { shizukuManager.clearForcedBluetoothSco() }
+                        val preClearOk = preClear.contains("RESULT=CLEARED", ignoreCase = true)
+                        lines += "Shizuku pre-force clean: ${if (preClearOk) "PASS" else "FAIL"}"
+                        if (!preClearOk) {
+                            failures++
+                        } else {
+                            val force = withContext(Dispatchers.IO) { shizukuManager.forceBluetoothSco() }
+                            val forceOk = force.contains("RESULT=OK", ignoreCase = true)
+                            val routeStillActiveAfterForce =
+                                audioRoutingManager.isPreferredCommunicationDeviceActive(
+                                    priorityAddress,
+                                    priorityRoutingName,
+                                )
+                            lines += "Shizuku force COMM+RECORD: ${if (forceOk) "PASS" else "FAIL"}"
+                            lines += "Route target dopo force: ${if (routeStillActiveAfterForce) "PASS" else "FAIL"}"
+                            if (!forceOk || !routeStillActiveAfterForce) failures++
+
+                            if (forceOk && routeStillActiveAfterForce) {
+                                // Give AudioPolicy a brief settling window after the verified force.
+                                delay(250L)
+                                val forcedMic = withContext(Dispatchers.IO) {
+                                    audioRoutingManager.testBluetoothMicrophone(
+                                        source = MicTestSource.VOICE_RECOGNITION,
+                                        durationMs = 3_500L,
+                                        preferredAddress = priorityAddress,
+                                        preferredName = priorityRoutingName,
+                                        targetDisplayName = priorityDisplayName,
+                                        routeMode = MicRouteMode.SYSTEM_DEFAULT,
+                                        scenario = MicTestScenario.SHIZUKU_FORCED,
+                                    )
+                                }
+                                lines += "SHIZUKU / VOICE_RECOGNITION: ${forcedMic.verdict} — ${forcedMic.actualInput} — RMS ${"%.0f".format(forcedMic.rms)}"
+                                if (forcedMic.verdict != MicTestVerdict.PASS) failures++
+                            }
+
+                            diagnosticStep = "9/9 Ripristino policy Shizuku"
+                            val clear = withContext(Dispatchers.IO) { shizukuManager.clearForcedBluetoothSco() }
+                            val clearOk = clear.contains("RESULT=CLEARED", ignoreCase = true)
+                            delay(150L)
+                            val routeStillActiveAfterClear =
+                                audioRoutingManager.isPreferredCommunicationDeviceActive(
+                                    priorityAddress,
+                                    priorityRoutingName,
+                                )
+                            lines += "Shizuku cleanup: ${if (clearOk) "PASS" else "FAIL"}"
+                            lines += "Route target dopo cleanup: ${if (routeStillActiveAfterClear) "PASS" else "FAIL"}"
+                            if (!clearOk || !routeStillActiveAfterClear) failures++
+                        }
+                    } else if (!shizukuReady) {
+                        lines += "Shizuku: SKIP — servizio non pronto (funzione facoltativa)"
+                    } else {
+                        failures++
+                        lines += "Shizuku: NON TESTATO — route prioritaria non piu attiva"
+                    }
+                }
+
+                diagnosticOk = failures == 0
+                lines += if (failures == 0) "ESITO COMPLETO: PASS"
+                else "ESITO COMPLETO: $failures controllo/i non superato/i"
+                diagnosticReport = lines.joinToString("\n")
+            } catch (cancelled: CancellationException) {
+                // Do not convert lifecycle/navigation cancellation into a fake diagnostic error.
+                throw cancelled
+            } catch (t: Throwable) {
+                diagnosticOk = false
+                lines += "ERRORE SUITE: ${t.javaClass.simpleName}: ${t.message}"
+                diagnosticReport = lines.joinToString("\n")
+            } finally {
+                if (shizukuManager.isForcedBluetoothScoApplied()) {
+                    withContext(NonCancellable + Dispatchers.IO) {
+                        shizukuManager.clearForcedBluetoothScoIfApplied()
+                    }
+                }
+                diagnosticRunning = false
+                diagnosticStep = null
+            }
+        }
+    }
+
+    val micPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        val run = pendingDiagnostic
+        pendingDiagnostic = false
+        if (granted && run) launchCompleteDiagnostic()
+    }
+
+    fun requestCompleteDiagnostic() {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            launchCompleteDiagnostic()
+        } else {
+            pendingDiagnostic = true
+            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
     }
 
     Scaffold(
@@ -76,8 +285,11 @@ fun HomeScreen(
                     titleContentColor = Purple80,
                 ),
                 actions = {
-                    IconButton(onClick = onSetupClick) {
-                        Icon(Icons.Default.Settings, contentDescription = "Configurazione", tint = Purple80)
+                    IconButton(onClick = onDetailsClick, enabled = !diagnosticRunning) {
+                        Icon(Icons.Default.Info, "Dettagli tecnici", tint = Purple80)
+                    }
+                    IconButton(onClick = onSetupClick, enabled = !diagnosticRunning) {
+                        Icon(Icons.Default.Settings, "Configurazione", tint = Purple80)
                     }
                 },
             )
@@ -90,471 +302,117 @@ fun HomeScreen(
                 .padding(innerPadding)
                 .padding(horizontal = 16.dp)
                 .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            Spacer(modifier = Modifier.height(8.dp))
-            StatusCard(routingState = routingState)
-
-            RoutingControlButton(
-                routingState = routingState,
-                onEnableRouting = {
-                    audioRoutingManager.routeToPreferredBluetooth(
-                        preferredAddress,
-                        preferredName,
-                    )
-                },
-                onDisableRouting = {
-                    audioRoutingManager.clearRouting()
-                    shizukuManager.clearForcedBluetoothSco()
-                },
-                onRetry = {
-                    audioRoutingManager.routeToPreferredBluetooth(
-                        preferredAddress,
-                        preferredName,
-                    )
-                },
-                canEnable = preferredAvailable,
-                targetName = preferredName,
-            )
-
-            DeviceSelector(
-                devices = availableDevices,
-                onDeviceSelected = { audioRoutingManager.routeToBluetooth(it.deviceInfo) },
-            )
-
-            ShizukuStatusCard(shizukuManager = shizukuManager)
-
-            AndroidAutoToolsCard(
-                audioRoutingManager = audioRoutingManager,
-                shizukuManager = shizukuManager,
-                shizukuStatus = shizukuStatus,
-                serviceState = serviceState,
-                micTestResults = micTestResults,
-                micLiveLevel = micLiveLevel,
-                preferredAddress = preferredAddress,
-                preferredName = preferredName,
-                preferredAvailable = preferredAvailable,
-                onDetailsClick = onDetailsClick,
-            )
-
-            HowItWorksCard()
-            Spacer(modifier = Modifier.height(24.dp))
-        }
-    }
-}
-
-/**
- * Compact Android Auto tools card.
- * Raw diagnostics are deliberately hidden from the home screen and moved to DetailsScreen.
- */
-@Composable
-private fun AndroidAutoToolsCard(
-    audioRoutingManager: AudioRoutingManager,
-    shizukuManager: ShizukuManager,
-    shizukuStatus: ShizukuStatus,
-    serviceState: UserServiceState,
-    micTestResults: Map<MicTestSource, AudioRoutingManager.MicTestResult>,
-    micLiveLevel: AudioRoutingManager.MicLiveLevel?,
-    preferredAddress: String?,
-    preferredName: String?,
-    preferredAvailable: Boolean,
-    onDetailsClick: () -> Unit,
-) {
-    val scope = rememberCoroutineScope()
-    val context = LocalContext.current
-    var lockJob by remember { mutableStateOf<Job?>(null) }
-    var lockActive by remember { mutableStateOf(false) }
-    var runningMicTest by remember { mutableStateOf<MicTestSource?>(null) }
-    var pendingMicTest by remember { mutableStateOf<MicTestSource?>(null) }
-    var forceUiMessage by remember(preferredAddress, preferredName) { mutableStateOf<String?>(null) }
-
-    val ready = shizukuStatus == ShizukuStatus.READY && serviceState == UserServiceState.READY
-    val targetDeviceName = preferredName?.takeIf { it.isNotBlank() } ?: "dispositivo prioritario"
-
-    fun launchMicTest(source: MicTestSource) {
-        if (runningMicTest != null) return
-        runningMicTest = source
-        scope.launch {
-            try {
-                withContext(Dispatchers.IO) {
-                    // Diagnostic tests are deliberately passive in 0.5.1: pressing TEST
-                    // must not change the global SCO route or re-negotiate HFP.
-                    audioRoutingManager.testBluetoothMicrophone(
-                        source = source,
-                        preferredAddress = preferredAddress,
-                        preferredName = preferredName,
-                    )
-                }
-            } finally {
-                runningMicTest = null
-            }
-        }
-    }
-
-    val micPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission(),
-    ) { granted ->
-        val source = pendingMicTest
-        pendingMicTest = null
-        if (granted && source != null) launchMicTest(source)
-    }
-
-    fun requestMicTest(source: MicTestSource) {
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
-            PackageManager.PERMISSION_GRANTED
-        ) {
-            launchMicTest(source)
-        } else {
-            pendingMicTest = source
-            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-        }
-    }
-
-    DisposableEffect(Unit) {
-        onDispose { lockJob?.cancel() }
-    }
-
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = SurfaceCard),
-    ) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Text(
-                "Android Auto / Shizuku",
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onSurface,
-            )
-
-            Text(
-                audioRoutingManager.currentCommunicationDeviceLabel(),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            Spacer(modifier = Modifier.height(6.dp))
+            StatusCard(routingState)
 
             Button(
-                enabled = ready && preferredAvailable,
                 onClick = {
-                    forceUiMessage = null
                     scope.launch {
-                        val message = withContext(Dispatchers.IO) {
-                            if (audioRoutingManager.reassertPreferredRouting(preferredAddress, preferredName)) {
-                                val raw = shizukuManager.forceBluetoothSco()
-                                when {
-                                    raw.contains("RESULT=FAILED", ignoreCase = true) ||
-                                        raw.contains("ERRORE", ignoreCase = true) -> "Forzatura Shizuku non riuscita"
-                                    raw.contains("AudioSystem.setForceUse(0,3) -> 0") &&
-                                        raw.contains("AudioSystem.setForceUse(2,3) -> 0") -> "Policy SCO COMMUNICATION + RECORD forzate"
-                                    else -> "Forzatura Shizuku eseguita: controlla Dettagli"
-                                }
-                            } else {
-                                "$targetDeviceName non connesso: nessuna forzatura eseguita"
-                            }
-                        }
-                        forceUiMessage = message
+                        audioRoutingManager.routeToPreferredBluetoothAndWait(
+                            priorityAddress,
+                            priorityRoutingName,
+                        )
                     }
                 },
+                enabled = priorityAvailable && !diagnosticRunning &&
+                    routingState !is RoutingState.Routing,
                 modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = Purple40),
             ) {
-                Text(
-                    if (preferredAvailable) "Forza $targetDeviceName ora"
-                    else if (preferredName == null) "Seleziona un dispositivo prioritario"
-                    else "$targetDeviceName non connesso"
-                )
+                Icon(Icons.Default.PowerSettingsNew, null)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(if (priorityAvailable) "Attiva $priorityDisplayName" else "Dispositivo prioritario non disponibile")
             }
 
-            OutlinedButton(
-                enabled = ready && preferredAvailable,
-                onClick = {
-                    if (lockActive) {
-                        lockJob?.cancel()
-                        lockJob = null
-                        lockActive = false
-                        scope.launch(Dispatchers.IO) { shizukuManager.clearForcedBluetoothSco() }
-                    } else {
-                        lockActive = true
-                        lockJob = scope.launch(Dispatchers.IO) {
-                            try {
-                                repeat(60) {
-                                    if (audioRoutingManager.reassertPreferredRouting(preferredAddress, preferredName)) {
-                                        shizukuManager.forceBluetoothSco()
-                                    }
-                                    delay(500)
-                                }
-                            } finally {
-                                withContext(Dispatchers.Main) { lockActive = false }
-                            }
+            if (routingState is RoutingState.Active) {
+                OutlinedButton(
+                    onClick = {
+                        audioRoutingManager.clearRoutingIfPreferred(priorityAddress, priorityRoutingName)
+                        shizukuManager.clearForcedBluetoothScoIfApplied()
+                    },
+                    enabled = !diagnosticRunning,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("Disattiva instradamento")
+                }
+            }
+
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = SurfaceCard),
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text("Diagnostica completa", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "Una sola esecuzione: routing reale, 6 registrazioni PCM (3 sorgenti × 2 modalità) + 1 registrazione VOICE_RECOGNITION sotto forzatura Shizuku, con cleanup finale.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Button(
+                        onClick = { requestCompleteDiagnostic() },
+                        enabled = priority != null && !diagnosticRunning &&
+                            routingState !is RoutingState.Routing,
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = Purple40),
+                    ) {
+                        Icon(Icons.Default.BugReport, null)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(if (diagnosticRunning) "DIAGNOSTICA IN CORSO" else "ESEGUI DIAGNOSTICA COMPLETA")
+                    }
+
+                    if (diagnosticRunning) {
+                        Text(
+                            diagnosticStep ?: "In corso…",
+                            color = StatusRouting,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        liveLevel?.let { level ->
+                            Text(
+                                when (level.phase) {
+                                    MicTestPhase.CALIBRATING -> "SILENZIO — calibrazione rumore"
+                                    MicTestPhase.SPEAKING -> "PARLA ORA nel microfono di $priorityDisplayName"
+                                    MicTestPhase.FINISHED -> "Acquisizione completata"
+                                },
+                                color = if (level.phase == MicTestPhase.SPEAKING) StatusActive else StatusRouting,
+                            )
+                            LinearProgressIndicator(
+                                progress = (level.rms / maxOf(level.thresholdRms * 2.0, 1.0))
+                                    .toFloat().coerceIn(0f, 1f),
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                            Text(
+                                "Livello ${"%.1f".format(level.dbfs)} dBFS • soglia ${"%.1f".format(level.thresholdDbfs)} dBFS",
+                                style = MaterialTheme.typography.labelSmall,
+                            )
                         }
                     }
-                },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(if (lockActive) "Ferma lock" else "Lock routing per 30 secondi")
-            }
 
-            Text(
-                "Diagnostica sorgente microfono",
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-
-            MicSourceTestRow(
-                source = MicTestSource.VOICE_COMMUNICATION,
-                targetDeviceName = targetDeviceName,
-                result = micTestResults[MicTestSource.VOICE_COMMUNICATION],
-                liveLevel = micLiveLevel?.takeIf { it.source == MicTestSource.VOICE_COMMUNICATION },
-                running = runningMicTest == MicTestSource.VOICE_COMMUNICATION,
-                enabled = runningMicTest == null && preferredAvailable,
-                onTest = { requestMicTest(MicTestSource.VOICE_COMMUNICATION) },
-            )
-
-            MicSourceTestRow(
-                source = MicTestSource.VOICE_RECOGNITION,
-                targetDeviceName = targetDeviceName,
-                result = micTestResults[MicTestSource.VOICE_RECOGNITION],
-                liveLevel = micLiveLevel?.takeIf { it.source == MicTestSource.VOICE_RECOGNITION },
-                running = runningMicTest == MicTestSource.VOICE_RECOGNITION,
-                enabled = runningMicTest == null && preferredAvailable,
-                onTest = { requestMicTest(MicTestSource.VOICE_RECOGNITION) },
-            )
-
-            MicSourceTestRow(
-                source = MicTestSource.MIC,
-                targetDeviceName = targetDeviceName,
-                result = micTestResults[MicTestSource.MIC],
-                liveLevel = micLiveLevel?.takeIf { it.source == MicTestSource.MIC },
-                running = runningMicTest == MicTestSource.MIC,
-                enabled = runningMicTest == null && preferredAvailable,
-                onTest = { requestMicTest(MicTestSource.MIC) },
-            )
-
-            forceUiMessage?.let {
-                Text(
-                    it,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (it.contains("non riuscita") || it.contains("non connesso")) StatusFailed else StatusActive,
-                )
-            }
-
-            OutlinedButton(
-                onClick = onDetailsClick,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Icon(Icons.Default.BugReport, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Dettagli tecnici")
-            }
-
-            if (!ready) {
-                Text(
-                    "Per le forzature avanzate Shizuku deve essere pronto e autorizzato.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = StatusRouting,
-                )
-            } else if (!preferredAvailable) {
-                Text(
-                    if (preferredName == null) "Seleziona prima un dispositivo prioritario in Configurazione."
-                    else "$targetDeviceName non e attualmente disponibile come dispositivo Bluetooth di comunicazione.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = StatusRouting,
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun MicSourceTestRow(
-    source: MicTestSource,
-    targetDeviceName: String,
-    result: AudioRoutingManager.MicTestResult?,
-    liveLevel: AudioRoutingManager.MicLiveLevel?,
-    running: Boolean,
-    enabled: Boolean,
-    onTest: () -> Unit,
-) {
-    val resultColor = when (result?.verdict) {
-        MicTestVerdict.PASS -> StatusActive
-        MicTestVerdict.NO_AUDIO -> StatusRouting
-        MicTestVerdict.WRONG_DEVICE,
-        MicTestVerdict.TARGET_NOT_CONFIGURED,
-        MicTestVerdict.TARGET_NOT_CONNECTED,
-        MicTestVerdict.ERROR,
-        MicTestVerdict.PERMISSION_REQUIRED,
-        -> StatusFailed
-        null -> MaterialTheme.colorScheme.onSurfaceVariant
-    }
-
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(5.dp),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(2.dp),
-            ) {
-                Text(
-                    source.label,
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.onSurface,
-                )
-
-                if (running && liveLevel != null) {
-                    Text(
-                        when (liveLevel.phase) {
-                            MicTestPhase.CALIBRATING -> "1/2 SILENZIO — calibrazione rumore"
-                            MicTestPhase.SPEAKING -> "2/2 PARLA NEL MICROFONO DI $targetDeviceName"
-                            MicTestPhase.FINISHED -> "Test completato"
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (liveLevel.phase == MicTestPhase.SPEAKING) StatusActive else StatusRouting,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                } else {
-                    Text(
-                        result?.summary ?: "Non testato",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = resultColor,
-                    )
+                    diagnosticReport?.let { report ->
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                        ) {
+                            Text(
+                                report,
+                                modifier = Modifier.padding(10.dp),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (diagnosticOk == true) StatusActive else StatusFailed,
+                            )
+                        }
+                    }
                 }
             }
 
-            FilledTonalButton(
-                enabled = enabled,
-                onClick = onTest,
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
-            ) {
-                if (running) {
-                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                } else {
-                    Icon(Icons.Default.Mic, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("TEST")
-                }
-            }
-        }
-
-        val meterRms = if (running && liveLevel != null) liveLevel.rms else result?.rms
-        val meterThreshold = if (running && liveLevel != null) liveLevel.thresholdRms else result?.thresholdRms
-        val meterDbfs = if (running && liveLevel != null) liveLevel.dbfs else result?.rmsDbfs
-        val thresholdDbfs = if (running && liveLevel != null) liveLevel.thresholdDbfs else result?.thresholdDbfs
-
-        if (meterRms != null && meterThreshold != null && meterThreshold > 0.0 && meterDbfs != null && thresholdDbfs != null) {
-            val meterProgress = (meterRms / (meterThreshold * 2.0)).toFloat().coerceIn(0f, 1f)
-            LinearProgressIndicator(
-                progress = meterProgress,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Text(
-                "Volume: ${"%.1f".format(meterDbfs)} dBFS  •  soglia min: ${"%.1f".format(thresholdDbfs)} dBFS  •  RMS ${"%.0f".format(meterRms)}/${"%.0f".format(meterThreshold)}",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-
-        if (!running && result != null) {
-            Text(
-                "Ingresso reale: ${result.actualInput}",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-    }
-}
-
-@Composable
-private fun RoutingControlButton(
-    routingState: RoutingState,
-    onEnableRouting: () -> Unit,
-    onDisableRouting: () -> Unit,
-    onRetry: () -> Unit,
-    canEnable: Boolean,
-    targetName: String?,
-) {
-    when (routingState) {
-        is RoutingState.Idle -> Button(
-            onClick = onEnableRouting,
-            enabled = canEnable,
-            modifier = Modifier.fillMaxWidth().height(56.dp),
-            shape = RoundedCornerShape(16.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = Purple40),
-        ) {
-            Icon(Icons.Default.PowerSettingsNew, contentDescription = null, modifier = Modifier.size(20.dp))
-            Spacer(modifier = Modifier.width(8.dp))
-            Text(
-                if (canEnable) "Attiva instradamento"
-                else if (targetName == null) "Seleziona dispositivo prioritario"
-                else "$targetName non connesso",
-                style = MaterialTheme.typography.labelLarge,
-            )
-        }
-
-        is RoutingState.Routing -> Button(
-            onClick = {},
-            enabled = false,
-            modifier = Modifier.fillMaxWidth().height(56.dp),
-            shape = RoundedCornerShape(16.dp),
-        ) {
-            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-            Spacer(modifier = Modifier.width(8.dp))
-            Text("Instradamento…")
-        }
-
-        is RoutingState.Active -> OutlinedButton(
-            onClick = onDisableRouting,
-            modifier = Modifier.fillMaxWidth().height(56.dp),
-            shape = RoundedCornerShape(16.dp),
-            colors = ButtonDefaults.outlinedButtonColors(contentColor = StatusActive),
-        ) {
-            Icon(Icons.Default.PowerSettingsNew, contentDescription = null, modifier = Modifier.size(20.dp))
-            Spacer(modifier = Modifier.width(8.dp))
-            Text("Disattiva instradamento", style = MaterialTheme.typography.labelLarge)
-        }
-
-        is RoutingState.Failed -> Button(
-            onClick = onRetry,
-            enabled = canEnable,
-            modifier = Modifier.fillMaxWidth().height(56.dp),
-            shape = RoundedCornerShape(16.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = StatusFailed.copy(alpha = 0.8f)),
-        ) {
-            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(20.dp))
-            Spacer(modifier = Modifier.width(8.dp))
-            Text("Riprova", style = MaterialTheme.typography.labelLarge)
-        }
-    }
-}
-
-@Composable
-private fun HowItWorksCard() {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = SurfaceCard),
-    ) {
-        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Come funziona", style = MaterialTheme.typography.titleMedium)
-            val steps = listOf(
-                "Il routing standard usa setCommunicationDevice per selezionare il dispositivo Bluetooth prioritario come dispositivo di comunicazione.",
-                "Il fallback Android Auto usa Shizuku per tentare di forzare le policy COMMUNICATION e RECORD su BT SCO.",
-                "Il pulsante LOCK ripete entrambe le forzature per 30 secondi, utile se Android Auto sovrascrive il routing quando parte Gemini.",
-                "Ogni test calibra prima il rumore (resta in silenzio), poi misura la voce e mostra volume, soglia minima e ingresso realmente usato.",
-            )
-            steps.forEachIndexed { index, step ->
-                Row {
-                    Text("${index + 1}.", color = Purple40, fontWeight = FontWeight.Bold, modifier = Modifier.width(20.dp))
-                    Text(step, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            }
+            DeviceSelector(availableDevices)
+            ShizukuStatusCard(shizukuManager)
+            Spacer(modifier = Modifier.height(24.dp))
         }
     }
 }

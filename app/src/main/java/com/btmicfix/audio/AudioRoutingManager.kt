@@ -12,28 +12,31 @@ import android.media.MediaRecorder
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
-import com.btmicfix.BuildConfig
 import com.btmicfix.util.Logger
+import com.btmicfix.util.Preferences
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlin.math.log10
+import kotlin.math.max
 import kotlin.math.sqrt
 
-/**
- * Core audio routing manager.
- *
- * Primary routing uses AudioManager.setCommunicationDevice() (API 31+).
- * The diagnostic microphone test additionally opens an AudioRecord using
- * VOICE_COMMUNICATION and explicitly requests the Bluetooth SCO input, so we can
- * distinguish "Android says SCO is selected" from "audio is really arriving from SCO".
- */
+/** Audio routing and real microphone diagnostics. */
 class AudioRoutingManager(private val context: Context) {
 
     private val audioManager: AudioManager =
         context.getSystemService<AudioManager>()
-            ?: throw IllegalStateException("AudioManager not available")
+            ?: throw IllegalStateException("AudioManager unavailable")
+
+    private val preferences = Preferences(context)
 
     private val _routingState = MutableStateFlow<RoutingState>(RoutingState.Idle)
     val routingState: StateFlow<RoutingState> = _routingState.asStateFlow()
@@ -47,10 +50,28 @@ class AudioRoutingManager(private val context: Context) {
     private val _micTestResults = MutableStateFlow<Map<MicTestSource, MicTestResult>>(emptyMap())
     val micTestResults: StateFlow<Map<MicTestSource, MicTestResult>> = _micTestResults.asStateFlow()
 
+    data class MicTestKey(
+        val source: MicTestSource,
+        val routeMode: MicRouteMode,
+        val scenario: MicTestScenario = MicTestScenario.BASELINE,
+    )
+
+    private val _allMicTestResults = MutableStateFlow<Map<MicTestKey, MicTestResult>>(emptyMap())
+    val allMicTestResults: StateFlow<Map<MicTestKey, MicTestResult>> = _allMicTestResults.asStateFlow()
+
     private val _micLiveLevel = MutableStateFlow<MicLiveLevel?>(null)
     val micLiveLevel: StateFlow<MicLiveLevel?> = _micLiveLevel.asStateFlow()
 
     private var currentRoutedDevice: AudioDeviceInfo? = null
+    private var lastObservedPriorityInput: AudioDeviceInfo? = null
+    private var monitoring = false
+
+    private val communicationDeviceChangedListener =
+        AudioManager.OnCommunicationDeviceChangedListener { device ->
+            Logger.i("Communication device changed: ${device?.let(::deviceLabel) ?: "none"}")
+            refreshAvailableDevices()
+            syncRoutingStateWithSystem()
+        }
 
     private val deviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
@@ -61,12 +82,7 @@ class AudioRoutingManager(private val context: Context) {
 
         override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
             Logger.i("Audio devices removed: ${removedDevices.map { deviceTypeToString(it.type) }}")
-            currentRoutedDevice?.let { routed ->
-                if (removedDevices.any { it.id == routed.id }) {
-                    Logger.w("Routed device was removed, clearing routing")
-                    clearRouting()
-                }
-            }
+            // Never clear from a stale cached id. Android may already have moved to another route.
             refreshAvailableDevices()
             syncRoutingStateWithSystem()
         }
@@ -92,167 +108,107 @@ class AudioRoutingManager(private val context: Context) {
         MIC(MediaRecorder.AudioSource.MIC, "MIC"),
     }
 
+    enum class MicRouteMode(val label: String) {
+        /** Observe the input Android chooses for the already-active communication route. */
+        SYSTEM_DEFAULT("ROUTE_ATTIVA"),
+        /** Ask AudioRecord for the safely-identified priority input. */
+        TARGET_PREFERRED("TARGET_ESPLICITO"),
+    }
+
+    enum class MicTestScenario(val label: String) {
+        BASELINE("BASELINE"),
+        SHIZUKU_FORCED("SHIZUKU_FORCED"),
+    }
+
     enum class MicTestPhase {
         CALIBRATING,
         SPEAKING,
         FINISHED,
     }
 
-    data class MicLiveLevel(
-        val source: MicTestSource,
-        val phase: MicTestPhase,
-        val rms: Double,
-        val peak: Int,
-        val dbfs: Double,
-        val thresholdRms: Double,
-        val thresholdPeak: Int,
-        val thresholdDbfs: Double,
-        val elapsedMs: Long,
-        val durationMs: Long,
-    )
-
-    /** Result of one real microphone diagnostic test. */
-    data class MicTestResult(
-        val source: MicTestSource,
-        val verdict: MicTestVerdict,
-        val targetDeviceName: String = "Dispositivo Bluetooth",
-        val requestedInput: String,
-        val actualInput: String,
-        val preferredDeviceAccepted: Boolean,
-        val communicationDevice: String,
-        val peak: Int,
-        val rms: Double,
-        val samplesRead: Long,
-        val durationMs: Long,
-        val details: String,
-        val baselinePeak: Int = 0,
-        val baselineRms: Double = 0.0,
-        val thresholdPeak: Int = 0,
-        val thresholdRms: Double = 0.0,
-        val routeMatchesRequested: Boolean = false,
-    ) {
-        val rmsDbfs: Double get() = amplitudeToDbfs(rms)
-        val thresholdDbfs: Double get() = amplitudeToDbfs(thresholdRms)
-
-        val summary: String
-            get() = when (verdict) {
-                MicTestVerdict.PASS -> "$targetDeviceName usato realmente come microfono"
-                MicTestVerdict.NO_AUDIO -> "$targetDeviceName selezionato, voce sotto soglia"
-                MicTestVerdict.WRONG_DEVICE -> "Ingresso reale diverso da $targetDeviceName"
-                MicTestVerdict.TARGET_NOT_CONFIGURED -> "Nessun dispositivo prioritario selezionato"
-                MicTestVerdict.TARGET_NOT_CONNECTED -> "$targetDeviceName non connesso"
-                MicTestVerdict.PERMISSION_REQUIRED -> "Permesso microfono necessario"
-                MicTestVerdict.ERROR -> "Test microfono non riuscito"
-            }
-    }
-
     enum class MicTestVerdict {
         PASS,
         NO_AUDIO,
         WRONG_DEVICE,
+        INDETERMINATE,
+        PREFERRED_REJECTED,
         TARGET_NOT_CONFIGURED,
         TARGET_NOT_CONNECTED,
         PERMISSION_REQUIRED,
         ERROR,
     }
 
+    data class MicLiveLevel(
+        val source: MicTestSource,
+        val routeMode: MicRouteMode,
+        val phase: MicTestPhase,
+        val rms: Double,
+        val dbfs: Double,
+        val thresholdRms: Double,
+        val thresholdDbfs: Double,
+    )
+
+    data class MicTestResult(
+        val source: MicTestSource,
+        val routeMode: MicRouteMode,
+        val scenario: MicTestScenario = MicTestScenario.BASELINE,
+        val verdict: MicTestVerdict,
+        val targetDeviceName: String,
+        val requestedInput: String,
+        val actualInput: String,
+        val preferredDeviceAccepted: Boolean,
+        val communicationDevice: String,
+        val peak: Int,
+        val rms: Double,
+        val baselinePeak: Int = 0,
+        val baselineRms: Double = 0.0,
+        val thresholdPeak: Int = 0,
+        val thresholdRms: Double = 0.0,
+        val peakDbfs: Double = DBFS_FLOOR,
+        val rmsDbfs: Double = DBFS_FLOOR,
+        val thresholdDbfs: Double = DBFS_FLOOR,
+        val samplesRead: Long,
+        val durationMs: Long,
+        val details: String,
+        val routeMatchesRequested: Boolean = false,
+    ) {
+        val summary: String
+            get() = when (verdict) {
+                MicTestVerdict.PASS -> "$targetDeviceName usato realmente come microfono"
+                MicTestVerdict.NO_AUDIO -> "$targetDeviceName instradato, voce sotto soglia"
+                MicTestVerdict.WRONG_DEVICE -> "Ingresso reale diverso da $targetDeviceName"
+                MicTestVerdict.INDETERMINATE -> "Ingresso Bluetooth reale non identificabile con certezza"
+                MicTestVerdict.PREFERRED_REJECTED -> "Audio dal target, ma setPreferredDevice rifiutato"
+                MicTestVerdict.TARGET_NOT_CONFIGURED -> "Nessun dispositivo prioritario selezionato"
+                MicTestVerdict.TARGET_NOT_CONNECTED -> "$targetDeviceName non disponibile"
+                MicTestVerdict.PERMISSION_REQUIRED -> "Permesso microfono necessario"
+                MicTestVerdict.ERROR -> "Test microfono non riuscito"
+            }
+    }
+
     fun startMonitoring() {
-        Logger.i("Starting audio device monitoring")
+        if (monitoring) return
+        monitoring = true
         audioManager.registerAudioDeviceCallback(deviceCallback, null)
+        audioManager.addOnCommunicationDeviceChangedListener(
+            context.mainExecutor,
+            communicationDeviceChangedListener,
+        )
         refreshAvailableDevices()
         syncRoutingStateWithSystem()
     }
 
     fun stopMonitoring() {
-        Logger.i("Stopping audio device monitoring")
-        audioManager.unregisterAudioDeviceCallback(deviceCallback)
-    }
-
-    fun routeToBluetooth(device: AudioDeviceInfo): RoutingState {
-        val deviceName = device.productName?.toString() ?: "Dispositivo Bluetooth"
-        Logger.i("Attempting to route to: $deviceName (type=${deviceTypeToString(device.type)})")
-
-        _routingState.value = RoutingState.Routing(deviceName)
-
+        if (!monitoring) return
+        monitoring = false
+        try { audioManager.unregisterAudioDeviceCallback(deviceCallback) } catch (_: Exception) {}
         try {
-            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-            val success = audioManager.setCommunicationDevice(device)
-
-            if (success) {
-                currentRoutedDevice = device
-                val state = RoutingState.Active(deviceName)
-                _routingState.value = state
-                Logger.i("Routing active: $deviceName")
-                return state
-            } else {
-                val state = RoutingState.Failed("setCommunicationDevice ha restituito false")
-                _routingState.value = state
-                Logger.e("setCommunicationDevice failed for $deviceName")
-                audioManager.mode = AudioManager.MODE_NORMAL
-                return state
-            }
-        } catch (e: Exception) {
-            val state = RoutingState.Failed(e.message ?: "Errore sconosciuto")
-            _routingState.value = state
-            Logger.e("Exception during routing", e)
-            audioManager.mode = AudioManager.MODE_NORMAL
-            return state
-        }
+            audioManager.removeOnCommunicationDeviceChangedListener(communicationDeviceChangedListener)
+        } catch (_: Exception) {}
     }
 
-    fun routeToFirstAvailableBluetooth(): RoutingState {
-        val btDevice = findFirstBluetoothCommunicationDevice()
-        if (btDevice == null) {
-            val state = RoutingState.Failed("Nessun dispositivo di comunicazione Bluetooth trovato")
-            _routingState.value = state
-            Logger.w("No BT communication devices available")
-            return state
-        }
-        return routeToBluetooth(btDevice)
-    }
-
-    fun routeToDeviceByAddress(address: String): RoutingState {
-        val targetDevice = getAvailableCommunicationDevices().find { deviceInfo ->
-            deviceInfo.address == address
-        }
-        if (targetDevice == null) {
-            val state = RoutingState.Failed("Dispositivo associato non trovato tra quelli disponibili")
-            _routingState.value = state
-            Logger.w("Device with address ${if (BuildConfig.DEBUG) address else "REDACTED"} not found")
-            return state
-        }
-        return routeToBluetooth(targetDevice)
-    }
-
-    /**
-     * Route only to the device explicitly selected by the user.
-     * If a priority device exists but is not connected we DO NOT fall back to another
-     * Bluetooth device (for example an Android Auto head unit).
-     */
     private fun bluetoothCommunicationDevices(): List<AudioDeviceInfo> =
-        getAvailableCommunicationDevices().filter {
-            it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
-        }
-
-    private fun deviceMatchesPreference(
-        device: AudioDeviceInfo?,
-        address: String?,
-        name: String?,
-    ): Boolean {
-        if (device == null) return false
-
-        // Prefer the MAC when Android exposes it. Some OEM builds return an empty
-        // AudioDeviceInfo.address for SCO devices, so a unique product name is the
-        // safe fallback rather than switching to the first Bluetooth device.
-        if (!address.isNullOrBlank() && device.address.isNotBlank()) {
-            return device.address.equals(address, ignoreCase = true)
-        }
-
-        // Name fallback is allowed only when Android does not expose the AudioDeviceInfo MAC.
-        return !name.isNullOrBlank() &&
-            device.address.isBlank() &&
-            device.productName?.toString()?.equals(name, ignoreCase = true) == true
-    }
+        audioManager.availableCommunicationDevices.filter(::isBluetoothMicDevice)
 
     private fun findPreferredBluetoothCommunicationDevice(
         address: String?,
@@ -261,292 +217,345 @@ class AudioRoutingManager(private val context: Context) {
         val devices = bluetoothCommunicationDevices()
 
         if (!address.isNullOrBlank()) {
-            devices.firstOrNull {
-                it.address.isNotBlank() && it.address.equals(address, ignoreCase = true)
+            devices.firstOrNull { device ->
+                device.address.isNotBlank() &&
+                    device.address.equals(address, ignoreCase = true)
             }?.let { return it }
         }
 
-        if (!name.isNullOrBlank()) {
-            val byName = devices.filter {
-                it.address.isBlank() &&
-                    it.productName?.toString()?.equals(name, ignoreCase = true) == true
+        val normalizedName = name?.trim()?.takeIf { it.isNotBlank() && !looksLikeMac(it) }
+        if (normalizedName != null) {
+            val matches = devices.filter { device ->
+                device.productName?.toString()?.trim()
+                    ?.equals(normalizedName, ignoreCase = true) == true
             }
-            if (byName.size == 1) return byName.first()
+            if (matches.size == 1) return matches.first()
+            if (matches.size > 1) {
+                Logger.w("Preferred Bluetooth name is ambiguous: $normalizedName")
+            }
         }
-
         return null
     }
 
-    fun routeToPreferredBluetooth(address: String?, name: String?): RoutingState {
-        val hasPreference = !address.isNullOrBlank() || !name.isNullOrBlank()
-        if (!hasPreference) {
-            val state = RoutingState.Failed("Nessun dispositivo prioritario selezionato")
-            _routingState.value = state
-            Logger.w("Routing refused: no priority Bluetooth device is configured")
-            return state
+    private fun deviceMatchesPreference(
+        device: AudioDeviceInfo?,
+        address: String?,
+        name: String?,
+    ): Boolean {
+        if (device == null || !isBluetoothMicDevice(device)) return false
+
+        if (!address.isNullOrBlank() && device.address.isNotBlank() &&
+            device.address.equals(address, ignoreCase = true)
+        ) return true
+
+        val normalizedName = name?.trim()?.takeIf { it.isNotBlank() && !looksLikeMac(it) }
+        if (normalizedName != null &&
+            device.productName?.toString()?.trim()?.equals(normalizedName, ignoreCase = true) == true
+        ) {
+            val sameName = bluetoothCommunicationDevices().filter { candidate ->
+                candidate.productName?.toString()?.trim()
+                    ?.equals(normalizedName, ignoreCase = true) == true
+            }
+            if (sameName.size == 1 ||
+                (sameName.isEmpty() && audioManager.communicationDevice?.id == device.id)
+            ) return true
+        }
+
+        val resolved = findPreferredBluetoothCommunicationDevice(address, name) ?: return false
+        return sameAudioEndpoint(device, resolved)
+    }
+
+    private fun sameAudioEndpoint(a: AudioDeviceInfo?, b: AudioDeviceInfo?): Boolean {
+        if (a == null || b == null) return false
+        if (a.id == b.id) return true
+        if (a.address.isNotBlank() && b.address.isNotBlank() &&
+            a.address.equals(b.address, ignoreCase = true)
+        ) return true
+
+        if (!isBluetoothMicDevice(a) || !isBluetoothMicDevice(b)) return false
+        val bName = b.productName?.toString()?.trim()
+            ?.takeIf { it.isNotBlank() && !looksLikeMac(it) } ?: return false
+        val sameName = bluetoothCommunicationDevices().filter { candidate ->
+            candidate.productName?.toString()?.trim()?.equals(bName, ignoreCase = true) == true
+        }
+        return sameName.size == 1 &&
+            a.productName?.toString()?.trim()?.equals(bName, ignoreCase = true) == true
+    }
+
+    private fun routeToPreferredBluetooth(address: String?, name: String?): RoutingState {
+        if (address.isNullOrBlank() && name.isNullOrBlank()) {
+            return RoutingState.Failed("Nessun dispositivo prioritario selezionato").also {
+                _routingState.value = it
+            }
+        }
+
+        val current = audioManager.communicationDevice
+        if (deviceMatchesPreference(current, address, name)) {
+            currentRoutedDevice = current
+            return RoutingState.Active(
+                current?.productName?.toString()?.takeIf { it.isNotBlank() }
+                    ?: name?.takeIf { it.isNotBlank() }
+                    ?: "Dispositivo Bluetooth"
+            ).also { _routingState.value = it }
         }
 
         val target = findPreferredBluetoothCommunicationDevice(address, name)
-        if (target != null) return routeToBluetooth(target)
+            ?: return RoutingState.Failed("Dispositivo prioritario non connesso").also {
+                _routingState.value = it
+            }
 
-        val state = RoutingState.Failed("Dispositivo prioritario non connesso")
-        _routingState.value = state
-        Logger.w("Preferred Bluetooth device is not currently available")
-        return state
+        return routeToBluetooth(target)
+    }
+
+    /**
+     * Wait until communicationDevice confirms the request; boolean acceptance is not enough.
+     * Routing requests are serialized process-wide because Activity and CompanionDeviceService
+     * use separate AudioRoutingManager instances but control the same AudioManager state.
+     */
+    suspend fun routeToPreferredBluetoothAndWait(
+        address: String?,
+        name: String?,
+        timeoutMs: Long = 30_000L,
+        pollMs: Long = 75L,
+    ): RoutingState = routingMutex.withLock {
+        val requested = routeToPreferredBluetooth(address, name)
+        if (requested is RoutingState.Failed) return@withLock requested
+
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs.coerceAtLeast(250L)
+        try {
+            do {
+                val actual = audioManager.communicationDevice
+                if (deviceMatchesPreference(actual, address, name)) {
+                    currentRoutedDevice = actual
+                    return@withLock RoutingState.Active(
+                        actual?.productName?.toString()?.takeIf { it.isNotBlank() }
+                            ?: name?.takeIf { it.isNotBlank() }
+                            ?: "Dispositivo Bluetooth"
+                    ).also { _routingState.value = it }
+                }
+                delay(pollMs.coerceAtLeast(25L))
+            } while (SystemClock.elapsedRealtime() < deadline)
+
+            clearRouting()
+            RoutingState.Failed("Timeout: Android non ha attivato il dispositivo prioritario").also {
+                _routingState.value = it
+            }
+        } catch (cancelled: CancellationException) {
+            // Cancel the pending communication-device request made by this app. Do not leave
+            // MODE_IN_COMMUNICATION or a delayed device switch behind after disconnect/cancel.
+            clearRouting()
+            throw cancelled
+        }
+    }
+
+    private fun routeToBluetooth(device: AudioDeviceInfo): RoutingState {
+        val deviceName = device.productName?.toString()?.takeIf { it.isNotBlank() }
+            ?: "Dispositivo Bluetooth"
+        _routingState.value = RoutingState.Routing(deviceName)
+
+        return try {
+            synchronized(audioModeLock) {
+                if (savedAudioModeBeforeRouting == null) {
+                    savedAudioModeBeforeRouting = audioManager.mode
+                }
+            }
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            val accepted = audioManager.setCommunicationDevice(device)
+            if (!accepted) {
+                restoreOwnAudioMode()
+                RoutingState.Failed("setCommunicationDevice ha restituito false").also {
+                    _routingState.value = it
+                }
+            } else {
+                val actual = audioManager.communicationDevice
+                if (sameAudioEndpoint(actual, device)) {
+                    currentRoutedDevice = actual
+                    RoutingState.Active(deviceName).also { _routingState.value = it }
+                } else {
+                    RoutingState.Routing(deviceName).also { _routingState.value = it }
+                }
+            }
+        } catch (e: Exception) {
+            restoreOwnAudioMode()
+            RoutingState.Failed(e.message ?: "Errore routing").also {
+                _routingState.value = it
+            }
+        }
+    }
+
+    private fun clearRouting() {
+        try { audioManager.clearCommunicationDevice() } catch (e: Exception) {
+            Logger.e("Error clearing communication device", e)
+        } finally {
+            restoreOwnAudioMode()
+            currentRoutedDevice = null
+            _routingState.value = RoutingState.Idle
+        }
+    }
+
+    /** Clear only if the real system route is still the selected priority device. */
+    fun clearRoutingIfPreferred(address: String?, name: String?): Boolean {
+        if (!deviceMatchesPreference(audioManager.communicationDevice, address, name)) {
+            // Another route already owns communication. Never force the global audio mode back
+            // to a stale value in this branch: that could disturb Android Auto / another call.
+            abandonOwnAudioModeOwnership()
+            syncRoutingStateWithSystem()
+            return false
+        }
+        clearRouting()
+        return true
+    }
+
+    private fun restoreOwnAudioMode() {
+        val oldMode = synchronized(audioModeLock) {
+            val value = savedAudioModeBeforeRouting
+            savedAudioModeBeforeRouting = null
+            value
+        } ?: return
+
+        try {
+            if (audioManager.mode == AudioManager.MODE_IN_COMMUNICATION) {
+                audioManager.mode = oldMode
+            }
+        } catch (e: Exception) {
+            Logger.w("Could not restore previous audio mode: ${e.javaClass.simpleName}")
+        }
+    }
+
+    private fun abandonOwnAudioModeOwnership() {
+        synchronized(audioModeLock) {
+            savedAudioModeBeforeRouting = null
+        }
     }
 
     fun isPreferredBluetoothAvailable(address: String?, name: String?): Boolean {
         if (address.isNullOrBlank() && name.isNullOrBlank()) return false
-        return findPreferredBluetoothCommunicationDevice(address, name) != null
-    }
-
-    /**
-     * Re-assert only when the SYSTEM communication device is not already the preferred
-     * one. This matters because the background CompanionDeviceService and the Activity
-     * own different AudioRoutingManager instances: currentRoutedDevice is therefore not
-     * a reliable source of truth across lifecycles.
-     */
-    fun reassertPreferredRouting(address: String?, name: String?): Boolean {
-        val systemDevice = audioManager.communicationDevice
-        if (deviceMatchesPreference(systemDevice, address, name)) {
-            currentRoutedDevice = systemDevice
-            val deviceName = systemDevice?.productName?.toString() ?: "Dispositivo Bluetooth"
-            _routingState.value = RoutingState.Active(deviceName)
-            Logger.d("Preferred routing already active on $deviceName; no SCO renegotiation")
-            return true
-        }
-
-        return routeToPreferredBluetooth(address, name) is RoutingState.Active
+        return findPreferredBluetoothCommunicationDevice(address, name) != null ||
+            deviceMatchesPreference(audioManager.communicationDevice, address, name)
     }
 
     fun isPreferredCommunicationDeviceActive(address: String?, name: String?): Boolean =
         deviceMatchesPreference(audioManager.communicationDevice, address, name)
 
-    fun clearRouting() {
-        Logger.i("Clearing audio routing")
-        try {
-            audioManager.clearCommunicationDevice()
-            audioManager.mode = AudioManager.MODE_NORMAL
-            currentRoutedDevice = null
-            _routingState.value = RoutingState.Idle
-            Logger.i("Routing cleared, back to system defaults")
-        } catch (e: Exception) {
-            Logger.e("Error clearing routing", e)
-        }
-    }
-
-    fun getAvailableCommunicationDevices(): List<AudioDeviceInfo> {
-        return audioManager.availableCommunicationDevices
-    }
-
-    fun findFirstBluetoothCommunicationDevice(): AudioDeviceInfo? {
-        return audioManager.availableCommunicationDevices.firstOrNull { device ->
-            device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-                device.type == AudioDeviceInfo.TYPE_BLE_HEADSET
-        }
-    }
-
-    fun isBluetoothRouted(): Boolean {
-        return currentRoutedDevice != null && _routingState.value is RoutingState.Active
-    }
-
-    fun reassertCurrentRouting(): Boolean {
-        val device = currentRoutedDevice ?: findFirstBluetoothCommunicationDevice() ?: return false
-        return try {
-            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-            val success = audioManager.setCommunicationDevice(device)
-            if (success) {
-                currentRoutedDevice = device
-                val deviceName = device.productName?.toString() ?: "Dispositivo Bluetooth"
-                _routingState.value = RoutingState.Active(deviceName)
-                Logger.d("Routing re-asserted on $deviceName")
-            } else {
-                Logger.w("Routing re-assertion rejected")
-            }
-            success
-        } catch (e: Exception) {
-            Logger.e("Routing re-assertion failed", e)
-            false
-        }
-    }
-
     fun currentCommunicationDeviceLabel(): String {
         val device = audioManager.communicationDevice
-        return if (device == null) {
-            "Nessun communication device"
-        } else {
-            "${device.productName ?: "Dispositivo"} (${deviceTypeToString(device.type)})"
-        }
+        return device?.let(::deviceLabel) ?: "Nessun communication device"
     }
 
     fun currentBluetoothCommunicationDeviceName(): String? {
         val device = audioManager.communicationDevice ?: return null
-        if (!isBluetoothMicType(device.type)) return null
+        if (!isBluetoothMicDevice(device)) return null
         return device.productName?.toString()?.takeIf { it.isNotBlank() }
     }
 
-    /**
-     * Real-world SCO microphone test.
-     *
-     * It opens AudioRecord with VOICE_COMMUNICATION, explicitly requests the Bluetooth
-     * SCO/BLE input that matches the selected communication device, records for a few
-     * seconds, and reports AudioRecord.routedDevice plus actual PCM activity.
-     *
-     * This test is intentionally diagnostic: it does not save or expose recorded audio.
-     */
     suspend fun testBluetoothMicrophone(
-        source: MicTestSource = MicTestSource.VOICE_COMMUNICATION,
-        durationMs: Long = 6_000L,
+        source: MicTestSource,
+        durationMs: Long = 4_500L,
         preferredAddress: String? = null,
         preferredName: String? = null,
+        targetDisplayName: String? = null,
+        routeMode: MicRouteMode = MicRouteMode.TARGET_PREFERRED,
+        scenario: MicTestScenario = MicTestScenario.BASELINE,
     ): MicTestResult = withContext(Dispatchers.IO) {
-        val configuredTargetName = preferredName?.takeIf { it.isNotBlank() } ?: "Dispositivo Bluetooth"
+        val targetLabel = targetDisplayName?.takeIf { it.isNotBlank() }
+            ?: preferredName?.takeIf { it.isNotBlank() }
+            ?: "Dispositivo prioritario"
 
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
         ) {
-            _micLiveLevel.value = null
             return@withContext publishMicTest(
-                MicTestResult(
-                    source = source,
-                    verdict = MicTestVerdict.PERMISSION_REQUIRED,
-                    targetDeviceName = configuredTargetName,
-                    requestedInput = "N/D",
-                    actualInput = "N/D",
-                    preferredDeviceAccepted = false,
-                    communicationDevice = currentCommunicationDeviceLabel(),
-                    peak = 0,
-                    rms = 0.0,
-                    samplesRead = 0,
-                    durationMs = 0,
-                    details = "SOURCE=${source.label} (${source.audioSource})\nPERMISSION_REQUIRED: android.permission.RECORD_AUDIO non concesso",
+                emptyMicResult(
+                    source, routeMode, MicTestVerdict.PERMISSION_REQUIRED, targetLabel,
+                    scenario = scenario,
+                    details = "Permesso RECORD_AUDIO non concesso",
                 )
             )
         }
 
-        // IMPORTANT: the diagnostic test must be passive. It must never renegotiate SCO
-        // or switch the global communication device just because TEST was pressed.
-        // Read the actual system route and refuse the test if it is not already the
-        // selected priority device. The explicit force-routing control remains the
-        // only action allowed to change the communication route.
-        val communicationDevice = audioManager.communicationDevice
-        val hasPreference = !preferredAddress.isNullOrBlank() || !preferredName.isNullOrBlank()
-
-        if (!hasPreference) {
-            _micLiveLevel.value = null
+        if (preferredAddress.isNullOrBlank() && preferredName.isNullOrBlank()) {
             return@withContext publishMicTest(
-                MicTestResult(
-                    source = source,
-                    verdict = MicTestVerdict.TARGET_NOT_CONFIGURED,
-                    targetDeviceName = "Dispositivo Bluetooth",
-                    requestedInput = "N/D",
-                    actualInput = communicationDevice?.let(::deviceLabel) ?: "Nessun communication device",
-                    preferredDeviceAccepted = false,
-                    communicationDevice = currentCommunicationDeviceLabel(),
-                    peak = 0,
-                    rms = 0.0,
-                    samplesRead = 0,
-                    durationMs = 0,
-                    details = "SOURCE=${source.label} (${source.audioSource})\nVERDICT=TARGET_NOT_CONFIGURED\nSeleziona prima un dispositivo prioritario in Configurazione",
+                emptyMicResult(
+                    source, routeMode, MicTestVerdict.TARGET_NOT_CONFIGURED, targetLabel,
+                    scenario = scenario,
+                    details = "Nessun dispositivo prioritario configurato",
                 )
             )
         }
 
         if (!isPreferredBluetoothAvailable(preferredAddress, preferredName)) {
-            _micLiveLevel.value = null
             return@withContext publishMicTest(
-                MicTestResult(
-                    source = source,
-                    verdict = MicTestVerdict.TARGET_NOT_CONNECTED,
-                    targetDeviceName = configuredTargetName,
-                    requestedInput = configuredTargetName,
-                    actualInput = communicationDevice?.let(::deviceLabel) ?: "Nessun communication device",
-                    preferredDeviceAccepted = false,
-                    communicationDevice = currentCommunicationDeviceLabel(),
-                    peak = 0,
-                    rms = 0.0,
-                    samplesRead = 0,
-                    durationMs = 0,
-                    details = "SOURCE=${source.label} (${source.audioSource})\nVERDICT=TARGET_NOT_CONNECTED\nIl dispositivo prioritario non e presente tra i communication device Bluetooth disponibili",
+                emptyMicResult(
+                    source, routeMode, MicTestVerdict.TARGET_NOT_CONNECTED, targetLabel,
+                    scenario = scenario,
+                    details = "Il dispositivo prioritario non e disponibile come communication device Bluetooth",
                 )
             )
         }
 
+        val communicationDevice = audioManager.communicationDevice
         if (!deviceMatchesPreference(communicationDevice, preferredAddress, preferredName)) {
-            _micLiveLevel.value = null
             return@withContext publishMicTest(
-                MicTestResult(
-                    source = source,
-                    verdict = MicTestVerdict.WRONG_DEVICE,
-                    targetDeviceName = configuredTargetName,
-                    requestedInput = preferredName ?: preferredAddress ?: "Dispositivo prioritario",
+                emptyMicResult(
+                    source, routeMode, MicTestVerdict.WRONG_DEVICE, targetLabel,
+                    scenario = scenario,
                     actualInput = communicationDevice?.let(::deviceLabel) ?: "Nessun communication device",
-                    preferredDeviceAccepted = false,
-                    communicationDevice = currentCommunicationDeviceLabel(),
-                    peak = 0,
-                    rms = 0.0,
-                    samplesRead = 0,
-                    durationMs = 0,
-                    details = buildString {
-                        appendLine("SOURCE=${source.label} (${source.audioSource})")
-                        appendLine("VERDICT=WRONG_DEVICE")
-                        appendLine("TEST_PASSIVE: routing non modificato")
-                        appendLine("Priorita attesa: ${preferredName ?: preferredAddress}")
-                        appendLine("Communication device reale: ${currentCommunicationDeviceLabel()}")
-                        append("Premi 'Forza ${configuredTargetName} ora' prima del test se necessario")
-                    },
+                    details = "Il communication device reale non coincide con il dispositivo prioritario",
                 )
             )
         }
 
         val inputDevices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).toList()
-        val communicationName = communicationDevice?.productName?.toString()
+        val bluetoothInputs = inputDevices.filter(::isBluetoothMicDevice)
         val communicationAddress = communicationDevice?.address
-        val bluetoothInputs = inputDevices.filter { isBluetoothMicType(it.type) }
-        val requestedInput = bluetoothInputs.firstOrNull { input ->
+        val communicationName = communicationDevice?.productName?.toString()?.trim()
+
+        val exactInput = bluetoothInputs.firstOrNull { input ->
             !communicationAddress.isNullOrBlank() && input.address.isNotBlank() &&
                 input.address.equals(communicationAddress, ignoreCase = true)
-        } ?: bluetoothInputs.firstOrNull { input ->
-            communicationName != null &&
-                input.productName?.toString()?.equals(communicationName, ignoreCase = true) == true
-        }
+        } ?: bluetoothInputs.filter { input ->
+            !communicationName.isNullOrBlank() &&
+                input.productName?.toString()?.trim()
+                    ?.equals(communicationName, ignoreCase = true) == true
+        }.singleOrNull()
 
-        if (requestedInput == null) {
-            val inputs = inputDevices.joinToString { deviceLabel(it) }
-            _micLiveLevel.value = null
+        val rememberedInput = lastObservedPriorityInput?.let { remembered ->
+            inputDevices.firstOrNull { it.id == remembered.id && isBluetoothMicDevice(it) }
+        }
+        val requestedInput = exactInput ?: rememberedInput
+
+        if (routeMode == MicRouteMode.TARGET_PREFERRED && requestedInput == null) {
             return@withContext publishMicTest(
-                MicTestResult(
-                    source = source,
-                    verdict = MicTestVerdict.WRONG_DEVICE,
-                    targetDeviceName = configuredTargetName,
-                    requestedInput = "Nessun input BT SCO/BLE disponibile",
-                    actualInput = "N/D",
-                    preferredDeviceAccepted = false,
-                    communicationDevice = currentCommunicationDeviceLabel(),
-                    peak = 0,
-                    rms = 0.0,
-                    samplesRead = 0,
-                    durationMs = 0,
+                emptyMicResult(
+                    source, routeMode, MicTestVerdict.INDETERMINATE, targetLabel,
+                    scenario = scenario,
+                    requestedInput = "Target input non identificabile in modo univoco",
                     details = buildString {
-                        appendLine("SOURCE=${source.label} (${source.audioSource})")
-                        appendLine("VERDICT=WRONG_DEVICE")
-                        appendLine("Nessun AudioDeviceInfo di input Bluetooth SCO/BLE trovato")
                         appendLine("Communication device: ${currentCommunicationDeviceLabel()}")
-                        appendLine("Input disponibili: $inputs")
+                        appendLine("Input Bluetooth disponibili:")
+                        bluetoothInputs.forEach { appendLine("- ${deviceLabel(it)}") }
                     }.trim(),
                 )
             )
         }
 
-        var recorder: AudioRecord? = null
-        try {
-            val sampleRate = 16_000
-            val channelMask = AudioFormat.CHANNEL_IN_MONO
-            val encoding = AudioFormat.ENCODING_PCM_16BIT
-            val minBuffer = AudioRecord.getMinBufferSize(sampleRate, channelMask, encoding)
-            val bufferSize = maxOf(minBuffer, sampleRate / 2 * 2, 4096)
+        val sampleRate = 16_000
+        val channelMask = AudioFormat.CHANNEL_IN_MONO
+        val encoding = AudioFormat.ENCODING_PCM_16BIT
+        val minBuffer = AudioRecord.getMinBufferSize(sampleRate, channelMask, encoding)
+        if (minBuffer <= 0) {
+            return@withContext publishMicTest(
+                emptyMicResult(
+                    source, routeMode, MicTestVerdict.ERROR, targetLabel,
+                    scenario = scenario,
+                    details = "AudioRecord.getMinBufferSize=$minBuffer",
+                )
+            )
+        }
 
-            recorder = AudioRecord.Builder()
+        val bufferSize = max(minBuffer * 2, 4096)
+        val recorder = try {
+            AudioRecord.Builder()
                 .setAudioSource(source.audioSource)
                 .setAudioFormat(
                     AudioFormat.Builder()
@@ -557,199 +566,232 @@ class AudioRoutingManager(private val context: Context) {
                 )
                 .setBufferSizeInBytes(bufferSize)
                 .build()
+        } catch (t: Throwable) {
+            return@withContext publishMicTest(
+                emptyMicResult(
+                    source, routeMode, MicTestVerdict.ERROR, targetLabel,
+                    scenario = scenario,
+                    details = "AudioRecord build: ${t.javaClass.simpleName}: ${t.message}",
+                )
+            )
+        }
 
-            if (recorder.state != AudioRecord.STATE_INITIALIZED) {
-                throw IllegalStateException("AudioRecord non inizializzato")
+        if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+            recorder.release()
+            return@withContext publishMicTest(
+                emptyMicResult(
+                    source, routeMode, MicTestVerdict.ERROR, targetLabel,
+                    scenario = scenario,
+                    details = "AudioRecord non inizializzato",
+                )
+            )
+        }
+
+        var preferredAccepted = false
+        var actualInput: AudioDeviceInfo? = null
+        val observedRoutedDeviceIds = linkedSetOf<Int>()
+        val observedRoutedDeviceLabels = linkedSetOf<String>()
+        var baselineSumSquares = 0.0
+        var baselineSamples = 0L
+        var baselinePeak = 0
+        var speechSumSquares = 0.0
+        var speechSamples = 0L
+        var speechPeak = 0
+        var totalSamples = 0L
+        var readErrors = 0
+        val startMs = SystemClock.elapsedRealtime()
+        val baselineEndMs = startMs + MIC_BASELINE_MS.coerceAtMost(durationMs / 2)
+        val endMs = startMs + durationMs.coerceAtLeast(MIC_BASELINE_MS + 1_000L)
+        val pcm = ShortArray(bufferSize / 2)
+
+        try {
+            preferredAccepted = when (routeMode) {
+                MicRouteMode.SYSTEM_DEFAULT -> false
+                MicRouteMode.TARGET_PREFERRED -> recorder.setPreferredDevice(requestedInput!!)
+            }
+            recorder.startRecording()
+
+            fun observeRoutedDevice() {
+                recorder.routedDevice?.let { routed ->
+                    actualInput = routed
+                    observedRoutedDeviceIds += routed.id
+                    observedRoutedDeviceLabels += deviceLabel(routed)
+                }
             }
 
-            val preferredAccepted = recorder.setPreferredDevice(requestedInput)
-            recorder.startRecording()
-            Thread.sleep(250)
+            // routedDevice is meaningful only while recording is active. Sample it immediately
+            // and on every loop, including silent/non-blocking reads, so a correctly routed but
+            // silent microphone is reported as NO_AUDIO rather than INDETERMINATE.
+            observeRoutedDevice()
 
-            val start = SystemClock.elapsedRealtime()
-            val calibrationMs = minOf(MIC_CALIBRATION_MS, maxOf(700L, durationMs / 3))
-            val pcm = ShortArray(1024)
-
-            var baselinePeak = 0
-            var baselineSumSquares = 0.0
-            var baselineSamples = 0L
-
-            var speechPeak = 0
-            var speechSumSquares = 0.0
-            var speechSamples = 0L
-
-            var totalSamples = 0L
-            var lastActualDevice: AudioDeviceInfo? = recorder.routedDevice
-            var readErrors = 0
-            var lastUiUpdate = 0L
-
-            while (SystemClock.elapsedRealtime() - start < durationMs) {
-                val read = recorder.read(pcm, 0, pcm.size, AudioRecord.READ_BLOCKING)
-                if (read <= 0) {
+            while (SystemClock.elapsedRealtime() < endMs) {
+                currentCoroutineContext().ensureActive()
+                observeRoutedDevice()
+                val read = recorder.read(pcm, 0, pcm.size, AudioRecord.READ_NON_BLOCKING)
+                if (read == 0) {
+                    Thread.sleep(10)
+                    continue
+                }
+                if (read < 0) {
                     readErrors++
                     if (readErrors >= 3) break
+                    Thread.sleep(10)
                     continue
                 }
 
-                val now = SystemClock.elapsedRealtime()
-                val elapsed = now - start
-                val calibrating = elapsed < calibrationMs
-                var blockPeak = 0
-                var blockSumSquares = 0.0
-
-                for (i in 0 until read) {
-                    val value = kotlin.math.abs(pcm[i].toInt())
-                    if (value > blockPeak) blockPeak = value
-                    blockSumSquares += value.toDouble() * value.toDouble()
-                }
-
-                if (calibrating) {
-                    if (blockPeak > baselinePeak) baselinePeak = blockPeak
-                    baselineSumSquares += blockSumSquares
-                    baselineSamples += read
-                } else {
-                    if (blockPeak > speechPeak) speechPeak = blockPeak
-                    speechSumSquares += blockSumSquares
-                    speechSamples += read
-                }
-
+                observeRoutedDevice()
                 totalSamples += read
-                recorder.routedDevice?.let { lastActualDevice = it }
+                var chunkSquares = 0.0
+                var chunkPeak = 0
+                for (i in 0 until read) {
+                    val value = pcm[i].toInt()
+                    val abs = kotlin.math.abs(value)
+                    if (abs > chunkPeak) chunkPeak = abs
+                    chunkSquares += value.toDouble() * value.toDouble()
+                }
+                val chunkRms = sqrt(chunkSquares / read.coerceAtLeast(1))
+                val now = SystemClock.elapsedRealtime()
 
-                if (now - lastUiUpdate >= 100L) {
-                    val blockRms = sqrt(blockSumSquares / read.toDouble())
-                    val baselineRmsNow = if (baselineSamples > 0)
-                        sqrt(baselineSumSquares / baselineSamples.toDouble()) else 0.0
-                    val thresholdRmsNow = maxOf(MIC_ABSOLUTE_MIN_RMS, baselineRmsNow * MIC_BASELINE_RMS_MULTIPLIER)
-                    val thresholdPeakNow = maxOf(MIC_ABSOLUTE_MIN_PEAK, (baselinePeak * MIC_BASELINE_PEAK_MULTIPLIER).toInt())
+                if (now < baselineEndMs) {
+                    baselineSumSquares += chunkSquares
+                    baselineSamples += read
+                    if (chunkPeak > baselinePeak) baselinePeak = chunkPeak
                     _micLiveLevel.value = MicLiveLevel(
-                        source = source,
-                        phase = if (calibrating) MicTestPhase.CALIBRATING else MicTestPhase.SPEAKING,
-                        rms = blockRms,
-                        peak = blockPeak,
-                        dbfs = amplitudeToDbfs(blockRms),
-                        thresholdRms = thresholdRmsNow,
-                        thresholdPeak = thresholdPeakNow,
-                        thresholdDbfs = amplitudeToDbfs(thresholdRmsNow),
-                        elapsedMs = elapsed,
-                        durationMs = durationMs,
+                        source, routeMode, MicTestPhase.CALIBRATING,
+                        chunkRms, rmsToDbfs(chunkRms), MIN_VOICE_RMS,
+                        rmsToDbfs(MIN_VOICE_RMS),
                     )
-                    lastUiUpdate = now
+                } else {
+                    speechSumSquares += chunkSquares
+                    speechSamples += read
+                    if (chunkPeak > speechPeak) speechPeak = chunkPeak
+                    val baselineRmsNow = if (baselineSamples > 0) {
+                        sqrt(baselineSumSquares / baselineSamples)
+                    } else 0.0
+                    val thresholdRmsNow = max(MIN_VOICE_RMS, baselineRmsNow * BASELINE_RMS_MULTIPLIER)
+                    _micLiveLevel.value = MicLiveLevel(
+                        source, routeMode, MicTestPhase.SPEAKING,
+                        chunkRms, rmsToDbfs(chunkRms), thresholdRmsNow,
+                        rmsToDbfs(thresholdRmsNow),
+                    )
                 }
             }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (t: Throwable) {
+            val result = emptyMicResult(
+                source, routeMode, MicTestVerdict.ERROR, targetLabel,
+                scenario = scenario,
+                requestedInput = requestedInput?.let(::deviceLabel) ?: "Nessun preferred input",
+                actualInput = actualInput?.let(::deviceLabel) ?: "N/D",
+                preferredAccepted = preferredAccepted,
+                details = "${t.javaClass.simpleName}: ${t.message}",
+            )
+            return@withContext publishMicTest(result)
+        } finally {
+            try {
+                if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) recorder.stop()
+            } catch (_: Exception) {}
+            recorder.release()
+        }
 
-            val actualInput = lastActualDevice
-            val baselineRms = if (baselineSamples > 0) sqrt(baselineSumSquares / baselineSamples.toDouble()) else 0.0
-            val speechRms = if (speechSamples > 0) sqrt(speechSumSquares / speechSamples.toDouble()) else 0.0
-            val thresholdRms = maxOf(MIC_ABSOLUTE_MIN_RMS, baselineRms * MIC_BASELINE_RMS_MULTIPLIER)
-            val thresholdPeak = maxOf(MIC_ABSOLUTE_MIN_PEAK, (baselinePeak * MIC_BASELINE_PEAK_MULTIPLIER).toInt())
+        val baselineRms = if (baselineSamples > 0) sqrt(baselineSumSquares / baselineSamples) else 0.0
+        val speechRms = if (speechSamples > 0) sqrt(speechSumSquares / speechSamples) else 0.0
+        val thresholdRms = max(MIN_VOICE_RMS, baselineRms * BASELINE_RMS_MULTIPLIER)
+        val thresholdPeak = max(MIN_VOICE_PEAK, (baselinePeak * BASELINE_PEAK_MULTIPLIER).toInt())
+        val audioPresent = speechSamples > 0 && speechRms >= thresholdRms && speechPeak >= thresholdPeak
 
-            val routeMatchesRequested = actualInput != null &&
-                isBluetoothMicType(actualInput.type) &&
-                (actualInput.id == requestedInput.id ||
-                    actualInput.productName?.toString()?.equals(
-                        requestedInput.productName?.toString(), ignoreCase = true
-                    ) == true)
+        val routeMatch = actualInputStronglyMatchesTarget(
+            actualInput = actualInput,
+            bluetoothInputs = bluetoothInputs,
+            requestedInput = requestedInput,
+            preferredAddress = preferredAddress,
+            preferredName = preferredName,
+        )
 
-            val audioPresent = speechRms >= thresholdRms && speechPeak >= thresholdPeak
-            val verdict = when {
-                !routeMatchesRequested -> MicTestVerdict.WRONG_DEVICE
-                !audioPresent -> MicTestVerdict.NO_AUDIO
-                else -> MicTestVerdict.PASS
-            }
+        val routeSwitchedDuringCapture = observedRoutedDeviceIds.size > 1
+        val definitelyWrongDevice = actualInputDefinitelyDiffersFromTarget(
+            actualInput = actualInput,
+            requestedInput = requestedInput,
+            preferredAddress = preferredAddress,
+        )
+        val verdict = when {
+            readErrors >= 3 -> MicTestVerdict.ERROR
+            actualInput == null -> MicTestVerdict.INDETERMINATE
+            routeSwitchedDuringCapture -> MicTestVerdict.INDETERMINATE
+            !isBluetoothMicDevice(actualInput!!) -> MicTestVerdict.WRONG_DEVICE
+            definitelyWrongDevice -> MicTestVerdict.WRONG_DEVICE
+            !routeMatch -> MicTestVerdict.INDETERMINATE
+            !audioPresent -> MicTestVerdict.NO_AUDIO
+            routeMode == MicRouteMode.TARGET_PREFERRED && !preferredAccepted ->
+                MicTestVerdict.PREFERRED_REJECTED
+            else -> MicTestVerdict.PASS
+        }
 
-            val elapsedTotal = SystemClock.elapsedRealtime() - start
-            val testedDeviceName = requestedInput.productName?.toString()?.takeIf { it.isNotBlank() }
-                ?: configuredTargetName
+        if (routeMode == MicRouteMode.SYSTEM_DEFAULT && routeMatch &&
+            !routeSwitchedDuringCapture && actualInput != null
+        ) {
+            lastObservedPriorityInput = actualInput
+        }
 
-            val result = MicTestResult(
+        _micLiveLevel.value = MicLiveLevel(
+            source, routeMode, MicTestPhase.FINISHED,
+            speechRms, rmsToDbfs(speechRms), thresholdRms, rmsToDbfs(thresholdRms),
+        )
+
+        publishMicTest(
+            MicTestResult(
                 source = source,
+                routeMode = routeMode,
+                scenario = scenario,
                 verdict = verdict,
-                targetDeviceName = testedDeviceName,
-                requestedInput = deviceLabel(requestedInput),
-                actualInput = actualInput?.let(::deviceLabel) ?: "Nessun routedDevice riportato",
+                targetDeviceName = targetLabel,
+                requestedInput = requestedInput?.let(::deviceLabel)
+                    ?: "Nessun preferred input (route attiva osservata)",
+                actualInput = actualInput?.let(::deviceLabel) ?: "N/D",
                 preferredDeviceAccepted = preferredAccepted,
                 communicationDevice = currentCommunicationDeviceLabel(),
                 peak = speechPeak,
                 rms = speechRms,
-                samplesRead = totalSamples,
-                durationMs = elapsedTotal,
                 baselinePeak = baselinePeak,
                 baselineRms = baselineRms,
                 thresholdPeak = thresholdPeak,
                 thresholdRms = thresholdRms,
-                routeMatchesRequested = routeMatchesRequested,
+                peakDbfs = peakToDbfs(speechPeak),
+                rmsDbfs = rmsToDbfs(speechRms),
+                thresholdDbfs = rmsToDbfs(thresholdRms),
+                samplesRead = totalSamples,
+                durationMs = SystemClock.elapsedRealtime() - startMs,
+                routeMatchesRequested = routeMatch,
                 details = buildString {
                     appendLine("SOURCE=${source.label} (${source.audioSource})")
+                    appendLine("ROUTE_MODE=${routeMode.label}")
+                    appendLine("SCENARIO=${scenario.label}")
                     appendLine("VERDICT=${verdict.name}")
-                    appendLine("Requested input: ${deviceLabel(requestedInput)}")
-                    appendLine("setPreferredDevice accepted: $preferredAccepted")
-                    appendLine("Actual routed input: ${actualInput?.let(::deviceLabel) ?: "null"}")
-                    appendLine("Route matches requested BT input: $routeMatchesRequested")
+                    appendLine("Target: $targetLabel")
                     appendLine("Communication device: ${currentCommunicationDeviceLabel()}")
-                    appendLine("Calibration: ${calibrationMs} ms (resta in silenzio)")
-                    appendLine("Baseline peak: $baselinePeak / 32767")
-                    appendLine("Baseline RMS: ${"%.1f".format(baselineRms)} (${"%.1f".format(amplitudeToDbfs(baselineRms))} dBFS)")
-                    appendLine("Voice peak: $speechPeak / 32767")
-                    appendLine("Voice RMS: ${"%.1f".format(speechRms)} (${"%.1f".format(amplitudeToDbfs(speechRms))} dBFS)")
-                    appendLine("Threshold peak: $thresholdPeak")
-                    appendLine("Threshold RMS: ${"%.1f".format(thresholdRms)} (${"%.1f".format(amplitudeToDbfs(thresholdRms))} dBFS)")
-                    appendLine("Samples read: $totalSamples")
-                    appendLine("Duration: $elapsedTotal ms")
-                    appendLine("All BT inputs: ${bluetoothInputs.joinToString { deviceLabel(it) }}")
-                    appendLine("All inputs: ${inputDevices.joinToString { deviceLabel(it) }}")
+                    appendLine("Preferred input: ${requestedInput?.let(::deviceLabel) ?: "nessuno"}")
+                    appendLine("setPreferredDevice called: ${routeMode == MicRouteMode.TARGET_PREFERRED}")
+                    appendLine("setPreferredDevice accepted: $preferredAccepted")
+                    appendLine("Actual routed input: ${actualInput?.let(::deviceLabel) ?: "N/D"}")
+                    appendLine("Observed routed inputs: ${observedRoutedDeviceLabels.joinToString(" | ").ifBlank { "N/D" }}")
+                    appendLine("Route switched during capture: $routeSwitchedDuringCapture")
+                    appendLine("Route match: $routeMatch")
+                    appendLine("Baseline RMS=${"%.1f".format(baselineRms)} peak=$baselinePeak")
+                    appendLine("Speech RMS=${"%.1f".format(speechRms)} peak=$speechPeak")
+                    appendLine("Threshold RMS=${"%.1f".format(thresholdRms)} peak=$thresholdPeak")
+                    appendLine("Samples=$totalSamples readErrors=$readErrors")
                 }.trim(),
             )
-
-            _micLiveLevel.value = MicLiveLevel(
-                source = source,
-                phase = MicTestPhase.FINISHED,
-                rms = speechRms,
-                peak = speechPeak,
-                dbfs = amplitudeToDbfs(speechRms),
-                thresholdRms = thresholdRms,
-                thresholdPeak = thresholdPeak,
-                thresholdDbfs = amplitudeToDbfs(thresholdRms),
-                elapsedMs = elapsedTotal,
-                durationMs = durationMs,
-            )
-
-            Logger.i("Mic diagnostic result:\n${result.details}")
-            publishMicTest(result)
-        } catch (t: Throwable) {
-            Logger.e("Bluetooth microphone diagnostic failed", t)
-            _micLiveLevel.value = null
-            publishMicTest(
-                MicTestResult(
-                    source = source,
-                    verdict = MicTestVerdict.ERROR,
-                    targetDeviceName = requestedInput.productName?.toString()?.takeIf { it.isNotBlank() }
-                        ?: configuredTargetName,
-                    requestedInput = deviceLabel(requestedInput),
-                    actualInput = recorder?.routedDevice?.let(::deviceLabel) ?: "N/D",
-                    preferredDeviceAccepted = false,
-                    communicationDevice = currentCommunicationDeviceLabel(),
-                    peak = 0,
-                    rms = 0.0,
-                    samplesRead = 0,
-                    durationMs = 0,
-                    details = buildString {
-                        appendLine("SOURCE=${source.label} (${source.audioSource})")
-                        append("ERROR=${t.javaClass.simpleName}: ${t.message ?: "nessun messaggio"}")
-                    },
-                )
-            )
-        } finally {
-            try { recorder?.stop() } catch (_: Throwable) {}
-            try { recorder?.release() } catch (_: Throwable) {}
-        }
+        )
     }
 
     fun clearMicDiagnostics() {
         _lastMicTestResult.value = null
         _micTestResults.value = emptyMap()
+        _allMicTestResults.value = emptyMap()
         _micLiveLevel.value = null
-        Logger.i("Microphone diagnostic results cleared")
+        lastObservedPriorityInput = null
     }
 
     private fun publishMicTest(result: MicTestResult): MicTestResult {
@@ -757,81 +799,191 @@ class AudioRoutingManager(private val context: Context) {
         _micTestResults.value = _micTestResults.value.toMutableMap().apply {
             put(result.source, result)
         }
+        _allMicTestResults.value = _allMicTestResults.value.toMutableMap().apply {
+            put(MicTestKey(result.source, result.routeMode, result.scenario), result)
+        }
         return result
+    }
+
+    private fun emptyMicResult(
+        source: MicTestSource,
+        routeMode: MicRouteMode,
+        verdict: MicTestVerdict,
+        targetName: String,
+        scenario: MicTestScenario = MicTestScenario.BASELINE,
+        requestedInput: String = "N/D",
+        actualInput: String = "N/D",
+        preferredAccepted: Boolean = false,
+        details: String,
+    ) = MicTestResult(
+        source = source,
+        routeMode = routeMode,
+        scenario = scenario,
+        verdict = verdict,
+        targetDeviceName = targetName,
+        requestedInput = requestedInput,
+        actualInput = actualInput,
+        preferredDeviceAccepted = preferredAccepted,
+        communicationDevice = currentCommunicationDeviceLabel(),
+        peak = 0,
+        rms = 0.0,
+        samplesRead = 0,
+        durationMs = 0,
+        details = details,
+    )
+
+    private fun actualInputDefinitelyDiffersFromTarget(
+        actualInput: AudioDeviceInfo?,
+        requestedInput: AudioDeviceInfo?,
+        preferredAddress: String?,
+    ): Boolean {
+        if (actualInput == null) return false
+        if (!isBluetoothMicDevice(actualInput)) return true
+
+        // A MAC/address contradiction is strong evidence. Friendly-name differences are NOT:
+        // OEM AudioDeviceInfo.productName may expose a model name while BluetoothDevice.alias
+        // exposes the user-renamed label. Treat name-only mismatches as INDETERMINATE instead
+        // of falsely declaring another physical device.
+        if (!preferredAddress.isNullOrBlank() && actualInput.address.isNotBlank()) {
+            return !actualInput.address.equals(preferredAddress, ignoreCase = true)
+        }
+
+        if (requestedInput != null && requestedInput.address.isNotBlank() &&
+            actualInput.address.isNotBlank()
+        ) {
+            return !actualInput.address.equals(requestedInput.address, ignoreCase = true)
+        }
+
+        return false
+    }
+
+    private fun actualInputStronglyMatchesTarget(
+        actualInput: AudioDeviceInfo?,
+        bluetoothInputs: List<AudioDeviceInfo>,
+        requestedInput: AudioDeviceInfo?,
+        preferredAddress: String?,
+        preferredName: String?,
+    ): Boolean {
+        if (actualInput == null || !isBluetoothMicDevice(actualInput)) return false
+
+        if (!preferredAddress.isNullOrBlank() && actualInput.address.isNotBlank() &&
+            actualInput.address.equals(preferredAddress, ignoreCase = true)
+        ) return true
+
+        val normalizedPreferredName = preferredName?.trim()
+            ?.takeIf { it.isNotBlank() && !looksLikeMac(it) }
+        if (normalizedPreferredName != null &&
+            actualInput.productName?.toString()?.trim()
+                ?.equals(normalizedPreferredName, ignoreCase = true) == true
+        ) {
+            val matches = bluetoothInputs.count { input ->
+                input.productName?.toString()?.trim()
+                    ?.equals(normalizedPreferredName, ignoreCase = true) == true
+            }
+            if (matches == 1) return true
+        }
+
+        if (requestedInput != null) {
+            if (actualInput.id == requestedInput.id) return true
+            if (actualInput.address.isNotBlank() && requestedInput.address.isNotBlank() &&
+                actualInput.address.equals(requestedInput.address, ignoreCase = true)
+            ) return true
+
+            val requestedName = requestedInput.productName?.toString()?.trim()
+                ?.takeIf { it.isNotBlank() && !looksLikeMac(it) }
+            if (requestedName != null &&
+                actualInput.productName?.toString()?.trim()
+                    ?.equals(requestedName, ignoreCase = true) == true
+            ) {
+                val matches = bluetoothInputs.count { input ->
+                    input.productName?.toString()?.trim()
+                        ?.equals(requestedName, ignoreCase = true) == true
+                }
+                if (matches == 1) return true
+            }
+        }
+
+        return false
     }
 
     private fun syncRoutingStateWithSystem() {
         val systemDevice = audioManager.communicationDevice
-        if (systemDevice != null && isBluetoothMicType(systemDevice.type)) {
+        val preferredAddress = preferences.pairedDeviceAddress
+        val preferredName = preferences.pairedDeviceName
+        val targetActive = preferences.hasPreferredDevice() &&
+            deviceMatchesPreference(systemDevice, preferredAddress, preferredName)
+
+        if (targetActive) {
             currentRoutedDevice = systemDevice
-            if (_routingState.value is RoutingState.Active || _routingState.value is RoutingState.Routing) {
-                val name = systemDevice.productName?.toString() ?: "Dispositivo Bluetooth"
-                _routingState.value = RoutingState.Active(name)
-            }
-        } else {
-            currentRoutedDevice = null
-            if (_routingState.value is RoutingState.Active) {
-                _routingState.value = RoutingState.Idle
-                Logger.i("System communication route is no longer Bluetooth; state reset to Idle")
-            }
+            _routingState.value = RoutingState.Active(
+                systemDevice?.productName?.toString()?.takeIf { it.isNotBlank() }
+                    ?: preferredName?.takeIf { it.isNotBlank() }
+                    ?: "Dispositivo Bluetooth"
+            )
+            return
+        }
+
+        currentRoutedDevice = null
+        val previous = _routingState.value
+        if (previous is RoutingState.Active || previous is RoutingState.Routing) {
+            // The target is no longer the system route. Ownership is now ambiguous, so do not
+            // write AudioManager.mode here; simply forget our saved mode and mirror reality.
+            abandonOwnAudioModeOwnership()
+            _routingState.value = RoutingState.Idle
         }
     }
 
     private fun refreshAvailableDevices() {
-        val commDevices = audioManager.availableCommunicationDevices
-        val btDevices = commDevices
-            .filter { device ->
-                device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-                    device.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                    device.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
-            }
-            .map { device ->
-                BluetoothAudioDevice(
-                    deviceInfo = device,
-                    name = device.productName?.toString() ?: "Dispositivo BT sconosciuto",
-                    type = device.type,
-                    typeLabel = deviceTypeToString(device.type),
-                )
-            }
-
-        _availableDevices.value = btDevices
-        Logger.d("Available BT devices: ${btDevices.map { "${it.name} (${it.typeLabel})" }}")
+        _availableDevices.value = bluetoothCommunicationDevices().map { device ->
+            BluetoothAudioDevice(
+                deviceInfo = device,
+                name = device.productName?.toString()?.takeIf { it.isNotBlank() }
+                    ?: "Dispositivo Bluetooth",
+                type = device.type,
+                typeLabel = deviceTypeToString(device.type),
+            )
+        }
     }
+
+    private fun isBluetoothMicDevice(device: AudioDeviceInfo): Boolean =
+        device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+            device.type == AudioDeviceInfo.TYPE_BLE_HEADSET
 
     private fun deviceLabel(device: AudioDeviceInfo): String =
         "${device.productName ?: "Dispositivo"} (${deviceTypeToString(device.type)}, id=${device.id})"
 
+    private fun deviceTypeToString(type: Int): String = when (type) {
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "BT SCO"
+        AudioDeviceInfo.TYPE_BLE_HEADSET -> "BLE Headset"
+        AudioDeviceInfo.TYPE_BLE_SPEAKER -> "BLE Speaker"
+        AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Microfono telefono"
+        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "Speaker telefono"
+        AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Cuffie cablate"
+        else -> "Tipo $type"
+    }
+
+    private fun looksLikeMac(value: String): Boolean =
+        Regex("(?i)^[0-9A-F]{2}(:[0-9A-F]{2}){5}$").matches(value.trim())
+
+    private fun rmsToDbfs(rms: Double): Double =
+        if (rms <= 0.0) DBFS_FLOOR
+        else max(DBFS_FLOOR, 20.0 * log10(rms / PCM_FULL_SCALE))
+
+    private fun peakToDbfs(peak: Int): Double =
+        if (peak <= 0) DBFS_FLOOR
+        else max(DBFS_FLOOR, 20.0 * log10(peak.toDouble() / PCM_FULL_SCALE))
+
     companion object {
-        const val MIC_CALIBRATION_MS = 1_200L
-        const val MIC_ABSOLUTE_MIN_RMS = 250.0
-        const val MIC_ABSOLUTE_MIN_PEAK = 1_500
-        const val MIC_BASELINE_RMS_MULTIPLIER = 2.5
-        const val MIC_BASELINE_PEAK_MULTIPLIER = 2.0
+        private val audioModeLock = Any()
+        @Volatile private var savedAudioModeBeforeRouting: Int? = null
+        private val routingMutex = Mutex()
 
-        fun amplitudeToDbfs(amplitude: Double): Double {
-            if (amplitude <= 0.0) return -96.0
-            val normalized = (amplitude / 32767.0).coerceIn(0.000001, 1.0)
-            return 20.0 * kotlin.math.log10(normalized)
-        }
-
-        fun isBluetoothMicType(type: Int): Boolean = when (type) {
-            AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
-            AudioDeviceInfo.TYPE_BLE_HEADSET,
-            -> true
-            else -> false
-        }
-
-        fun deviceTypeToString(type: Int): String = when (type) {
-            AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "BT SCO"
-            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "BT A2DP"
-            AudioDeviceInfo.TYPE_BLE_HEADSET -> "Cuffie BLE"
-            AudioDeviceInfo.TYPE_BLE_SPEAKER -> "Altoparlante BLE"
-            AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Microfono integrato"
-            AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "Altoparlante integrato"
-            AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Cuffie con filo"
-            AudioDeviceInfo.TYPE_USB_DEVICE -> "Dispositivo USB"
-            AudioDeviceInfo.TYPE_USB_HEADSET -> "Cuffie USB"
-            else -> "Tipo $type"
-        }
+        private const val MIC_BASELINE_MS = 1_200L
+        private const val BASELINE_RMS_MULTIPLIER = 3.0
+        private const val BASELINE_PEAK_MULTIPLIER = 1.8
+        private const val MIN_VOICE_RMS = 250.0
+        private const val MIN_VOICE_PEAK = 1500
+        private const val PCM_FULL_SCALE = 32768.0
+        private const val DBFS_FLOOR = -120.0
     }
 }

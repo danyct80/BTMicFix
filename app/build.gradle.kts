@@ -12,10 +12,10 @@ android {
 
     defaultConfig {
         applicationId = "com.btmicfix"
-        minSdk = 31
+        minSdk = 33
         targetSdk = 34
-        versionCode = 8
-        versionName = "0.5.3-stable-identity"
+        versionCode = 16
+        versionName = "0.6.5-final-audit"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

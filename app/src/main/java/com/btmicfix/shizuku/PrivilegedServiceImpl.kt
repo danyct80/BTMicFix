@@ -2,152 +2,248 @@ package com.btmicfix.shizuku
 
 import com.btmicfix.IPrivilegedService
 import com.btmicfix.util.Logger
+import java.util.concurrent.TimeUnit
 
-/**
- * Shizuku UserService implementation that runs as the ADB shell user (UID 2000).
- *
- * IMPORTANT:
- * - The public AudioManager.setCommunicationDevice() API remains the primary route selector.
- * - This privileged service is only an Android Auto/OEM fallback.
- * - The privileged force is intentionally restricted to Bluetooth SCO for communication/record.
- *
- * Two mechanisms are attempted, in this order:
- *  1) hidden AudioSystem.setForceUse() via reflection from the shell process;
- *  2) `cmd audio set-force-use` only if the ROM exposes that shell command.
- *
- * Not every Android/HyperOS build exposes either mechanism. The returned diagnostic string
- * explicitly says what succeeded or failed, so the UI never claims a privileged force worked
- * when it did not.
- */
+/** Shizuku UserService. Runs as shell and exposes narrowly-scoped audio diagnostics/actions. */
 class PrivilegedServiceImpl : IPrivilegedService.Stub() {
 
-    companion object {
-        // AudioSystem force-use constants. These values are stable in AOSP.
-        private const val FOR_COMMUNICATION = 0
-        private const val FOR_RECORD = 2
-        private const val FORCE_NONE = 0
-        private const val FORCE_BT_SCO = 3
-        private const val AUDIO_STATUS_OK = 0
+    private val forceStateLock = Any()
+    private var savedCommunicationForce: Int? = null
+    private var savedRecordForce: Int? = null
 
-        // Generic command API is diagnostic-only and tightly allowlisted.
-        private val ALLOWED_PREFIXES = listOf(
-            "dumpsys audio",
-            "dumpsys media.audio_policy",
-            "cmd audio",
-            "settings get",
-        )
-    }
+    data class ForceResult(val success: Boolean, val message: String)
+    data class ReadForceResult(val success: Boolean, val value: Int?, val message: String)
 
     override fun destroy() {
-        Logger.i("PrivilegedService: destroy() called, shutting down")
-        System.exit(0)
+        // Last-resort safety: if the UserService is removed while it still owns a saved
+        // force-use snapshot, restore that snapshot before terminating the shell process.
+        // Normal UI cleanup already does this; this path protects Activity/process teardown.
+        try {
+            if (savedCommunicationForce != null || savedRecordForce != null) {
+                clearForcedBluetoothSco()
+            }
+        } catch (t: Throwable) {
+            Logger.e("PrivilegedService destroy cleanup failed", t)
+        } finally {
+            System.exit(0)
+        }
     }
 
     override fun executeAudioCommand(command: String): String? {
         if (ALLOWED_PREFIXES.none { command.startsWith(it) }) {
-            Logger.e("PrivilegedService: blocked disallowed command: $command")
-            return "ERROR: Command not in allowlist"
+            return "ERROR: command not allowed"
         }
         return runShell(command)
     }
 
-    override fun getAudioDump(): String? {
-        val audio = runShell("dumpsys audio").orEmpty()
-        val policy = runShell("dumpsys media.audio_policy").orEmpty()
-        return buildString {
-            appendLine("===== dumpsys audio =====")
-            appendLine(audio)
-            appendLine("===== dumpsys media.audio_policy =====")
-            appendLine(policy)
-        }.trim()
-    }
+    override fun getAudioDump(): String? = runShell("dumpsys audio")
 
-    /**
-     * Legacy entry point. Here deviceType is interpreted as an AudioSystem FORCE_* config,
-     * NOT an AudioDeviceInfo.TYPE_* value. Kept only so older UI/code still compiles.
-     */
     override fun forceAudioStrategy(strategy: Int, deviceType: Int): Boolean {
-        if (strategy !in 0..15 || deviceType !in 0..20) return false
+        if (strategy !in 0..15 || deviceType !in 0..30) return false
         return setForceUseBestEffort(strategy, deviceType).success
     }
 
-    override fun forceBluetoothSco(): String {
-        val comm = setForceUseBestEffort(FOR_COMMUNICATION, FORCE_BT_SCO)
-        val record = setForceUseBestEffort(FOR_RECORD, FORCE_BT_SCO)
-        val verification = readForceUseSummary()
+    override fun forceBluetoothSco(): String = synchronized(forceStateLock) {
+        // Snapshot the pre-existing global policy only once. Repeated force calls (e.g. lock
+        // mode) must not overwrite the original values with BT_SCO=3, otherwise cleanup
+        // would restore the forced state instead of the real previous state.
+        if (savedCommunicationForce == null || savedRecordForce == null) {
+            val beforeCommunication = getForceUseBestEffort(FOR_COMMUNICATION)
+            val beforeRecord = getForceUseBestEffort(FOR_RECORD)
+            if (!beforeCommunication.success || beforeCommunication.value == null ||
+                !beforeRecord.success || beforeRecord.value == null
+            ) {
+                return@synchronized buildString {
+                    appendLine("RESULT=FAILED")
+                    appendLine("Cannot snapshot pre-force audio policy; refusing to modify global force-use state")
+                    appendLine("COMMUNICATION before -> ${beforeCommunication.message}")
+                    appendLine("RECORD before -> ${beforeRecord.message}")
+                }.trim()
+            }
+            savedCommunicationForce = beforeCommunication.value
+            savedRecordForce = beforeRecord.value
+        }
 
-        val ok = comm.success || record.success
-        val result = buildString {
-            appendLine(if (ok) "RESULT=PARTIAL_OR_OK" else "RESULT=FAILED")
-            appendLine("COMMUNICATION -> ${comm.message}")
-            appendLine("RECORD        -> ${record.message}")
-            appendLine("--- policy verification ---")
-            append(verification.ifBlank { "No force-use lines found in dumpsys output" })
+        val communicationSet = setForceUseBestEffort(FOR_COMMUNICATION, FORCE_BT_SCO)
+        val recordSet = setForceUseBestEffort(FOR_RECORD, FORCE_BT_SCO)
+        val communicationRead = getForceUseBestEffort(FOR_COMMUNICATION)
+        val recordRead = getForceUseBestEffort(FOR_RECORD)
+
+        val communicationOk = communicationSet.success &&
+            communicationRead.success && communicationRead.value == FORCE_BT_SCO
+        val recordOk = recordSet.success &&
+            recordRead.success && recordRead.value == FORCE_BT_SCO
+
+        if (!communicationOk || !recordOk) {
+            // Force-use is global process/system policy. Never intentionally leave a half-applied
+            // state: immediately roll back to the snapshot taken above.
+            val rollback = clearForcedBluetoothSco()
+            val rollbackOk = rollback.contains("RESULT=CLEARED", ignoreCase = true)
+            return@synchronized buildString {
+                appendLine("RESULT=${if (rollbackOk) "FAILED_ROLLED_BACK" else "FAILED_DIRTY"}")
+                appendLine("COMM_SUCCESS=$communicationOk")
+                appendLine("RECORD_SUCCESS=$recordOk")
+                appendLine("COMMUNICATION set -> ${communicationSet.message}")
+                appendLine("RECORD set -> ${recordSet.message}")
+                appendLine("COMMUNICATION verify -> ${communicationRead.message}")
+                appendLine("RECORD verify -> ${recordRead.message}")
+                appendLine("--- rollback ---")
+                append(rollback)
+            }.trim()
+        }
+
+        buildString {
+            appendLine("RESULT=OK")
+            appendLine("PREVIOUS_COMMUNICATION=$savedCommunicationForce")
+            appendLine("PREVIOUS_RECORD=$savedRecordForce")
+            appendLine("COMM_SUCCESS=true")
+            appendLine("RECORD_SUCCESS=true")
+            appendLine("COMMUNICATION set -> ${communicationSet.message}")
+            appendLine("RECORD set -> ${recordSet.message}")
+            appendLine("COMMUNICATION verify -> ${communicationRead.message}")
+            appendLine("RECORD verify -> ${recordRead.message}")
         }.trim()
-
-        Logger.i("PrivilegedService forceBluetoothSco:\n$result")
-        return result
     }
 
-    override fun clearForcedBluetoothSco(): String {
-        val comm = setForceUseBestEffort(FOR_COMMUNICATION, FORCE_NONE)
-        val record = setForceUseBestEffort(FOR_RECORD, FORCE_NONE)
-        val verification = readForceUseSummary()
+    override fun clearForcedBluetoothSco(): String = synchronized(forceStateLock) {
+        val currentCommunication = getForceUseBestEffort(FOR_COMMUNICATION)
+        val currentRecord = getForceUseBestEffort(FOR_RECORD)
 
-        return buildString {
-            appendLine("COMMUNICATION clear -> ${comm.message}")
-            appendLine("RECORD clear        -> ${record.message}")
-            appendLine("--- policy verification ---")
-            append(verification.ifBlank { "No force-use lines found in dumpsys output" })
+        val targetCommunication = savedCommunicationForce ?: run {
+            val value = currentCommunication.value
+            if (!currentCommunication.success || value == null ||
+                (value != FORCE_NONE && value != FORCE_BT_SCO)
+            ) {
+                return@synchronized buildString {
+                    appendLine("RESULT=CLEAR_FAILED")
+                    appendLine("No saved policy and current COMMUNICATION force is not safely resettable")
+                    appendLine("COMMUNICATION current -> ${currentCommunication.message}")
+                    appendLine("RECORD current -> ${currentRecord.message}")
+                }.trim()
+            }
+            FORCE_NONE
+        }
+
+        val targetRecord = savedRecordForce ?: run {
+            val value = currentRecord.value
+            if (!currentRecord.success || value == null ||
+                (value != FORCE_NONE && value != FORCE_BT_SCO)
+            ) {
+                return@synchronized buildString {
+                    appendLine("RESULT=CLEAR_FAILED")
+                    appendLine("No saved policy and current RECORD force is not safely resettable")
+                    appendLine("COMMUNICATION current -> ${currentCommunication.message}")
+                    appendLine("RECORD current -> ${currentRecord.message}")
+                }.trim()
+            }
+            FORCE_NONE
+        }
+
+        val communicationSet = setForceUseBestEffort(FOR_COMMUNICATION, targetCommunication)
+        val recordSet = setForceUseBestEffort(FOR_RECORD, targetRecord)
+        val communicationRead = getForceUseBestEffort(FOR_COMMUNICATION)
+        val recordRead = getForceUseBestEffort(FOR_RECORD)
+
+        val communicationOk = communicationSet.success &&
+            communicationRead.success && communicationRead.value == targetCommunication
+        val recordOk = recordSet.success &&
+            recordRead.success && recordRead.value == targetRecord
+
+        val resultCode = when {
+            communicationOk && recordOk -> "CLEARED"
+            communicationOk || recordOk -> "PARTIAL_CLEAR"
+            else -> "CLEAR_FAILED"
+        }
+
+        if (communicationOk && recordOk) {
+            savedCommunicationForce = null
+            savedRecordForce = null
+        }
+
+        buildString {
+            appendLine("RESULT=$resultCode")
+            appendLine("RESTORE_COMMUNICATION=$targetCommunication")
+            appendLine("RESTORE_RECORD=$targetRecord")
+            appendLine("COMM_CLEAR_SUCCESS=$communicationOk")
+            appendLine("RECORD_CLEAR_SUCCESS=$recordOk")
+            appendLine("COMMUNICATION restore -> ${communicationSet.message}")
+            appendLine("RECORD restore -> ${recordSet.message}")
+            appendLine("COMMUNICATION verify -> ${communicationRead.message}")
+            appendLine("RECORD verify -> ${recordRead.message}")
         }.trim()
     }
 
     override fun getRoutingCapabilities(): String {
-        val help = runShell("cmd audio help").orEmpty()
-        val hasSetForceUse = help.contains("set-force-use", ignoreCase = true)
-        val reflectionProbe = probeAudioSystemReflection()
-
+        val communication = getForceUseBestEffort(FOR_COMMUNICATION)
+        val record = getForceUseBestEffort(FOR_RECORD)
         return buildString {
-            appendLine("AudioSystem reflection: $reflectionProbe")
-            appendLine("cmd audio set-force-use: ${if (hasSetForceUse) "AVAILABLE" else "NOT LISTED"}")
-            appendLine("--- cmd audio help ---")
-            append(help.ifBlank { "No output" })
-        }.trim()
+            appendLine("AudioSystem.getForceUse=${if (communication.success && record.success) "AVAILABLE" else "PARTIAL_OR_UNAVAILABLE"}")
+            appendLine("FOR_COMMUNICATION=${communication.value ?: "N/D"}")
+            append("FOR_RECORD=${record.value ?: "N/D"}")
+        }
     }
 
-    private data class ForceResult(val success: Boolean, val message: String)
+    private fun getForceUseBestEffort(usage: Int): ReadForceResult {
+        val reflection = try {
+            val audioSystem = Class.forName("android.media.AudioSystem")
+            val method = audioSystem.getDeclaredMethod(
+                "getForceUse",
+                Int::class.javaPrimitiveType,
+            )
+            method.isAccessible = true
+            val raw = method.invoke(null, usage)
+            val value = (raw as? Number)?.toInt()
+            if (value != null) {
+                return ReadForceResult(
+                    success = true,
+                    value = value,
+                    message = "AudioSystem.getForceUse($usage) -> $value",
+                )
+            }
+            "reflection returned null"
+        } catch (t: Throwable) {
+            Logger.w("getForceUse reflection unavailable: ${t.javaClass.simpleName}")
+            "${t.javaClass.simpleName}: ${t.message}"
+        }
 
-    /**
-     * Prefer hidden AudioSystem.setForceUse() because many current ROMs do not expose an
-     * equivalent `cmd audio` shell subcommand. If reflection is blocked by hidden-API policy,
-     * fall back to the shell command only when `cmd audio help` advertises it.
-     */
-    private fun setForceUseBestEffort(usage: Int, config: Int): ForceResult {
-        val reflected = setForceUseViaReflection(usage, config)
-        if (reflected.success) return reflected
-
-        val help = runShell("cmd audio help").orEmpty()
-        if (!help.contains("set-force-use", ignoreCase = true)) {
-            return ForceResult(
-                false,
-                "reflection failed (${reflected.message}); cmd audio set-force-use not exposed by ROM"
+        // Some OEM builds allow shell setForceUse() but hide getForceUse() reflection.
+        // dumpsys audio exposes the same force-use state and was already proven useful on
+        // affected Android/HyperOS devices, so use it as a read-only verification fallback.
+        val dump = runShell("dumpsys audio")
+        val value = parseForceUseFromDump(dump, usage)
+        return if (value != null) {
+            ReadForceResult(
+                success = true,
+                value = value,
+                message = "dumpsys audio forceUse($usage) -> $value (reflection: $reflection)",
+            )
+        } else {
+            ReadForceResult(
+                success = false,
+                value = null,
+                message = "verification unavailable (reflection: $reflection)",
             )
         }
+    }
 
-        val shell = runShell("cmd audio set-force-use $usage $config")
-        val shellOk = shell != null &&
-            !shell.startsWith("ERROR", ignoreCase = true) &&
-            !shell.contains("Unknown command", ignoreCase = true) &&
-            !shell.contains("Exception", ignoreCase = true)
-
-        return if (shellOk) {
-            ForceResult(true, "shell accepted: ${shell.ifBlank { "OK (no output)" }}")
-        } else {
-            ForceResult(false, "reflection failed (${reflected.message}); shell failed: ${shell ?: "null"}")
+    private fun parseForceUseFromDump(dump: String, usage: Int): Int? {
+        val patterns = when (usage) {
+            FOR_COMMUNICATION -> listOf(
+                Regex("(?im)^\\s*Force use for communications?\\s*[:=]\\s*(\\d+)"),
+                Regex("(?im)^\\s*FOR_COMMUNICATION\\s*[:=]\\s*(\\d+)"),
+            )
+            FOR_RECORD -> listOf(
+                Regex("(?im)^\\s*Force use for record\\s*[:=]\\s*(\\d+)"),
+                Regex("(?im)^\\s*FOR_RECORD\\s*[:=]\\s*(\\d+)"),
+            )
+            else -> emptyList()
+        }
+        return patterns.firstNotNullOfOrNull { regex ->
+            regex.find(dump)?.groupValues?.getOrNull(1)?.toIntOrNull()
         }
     }
 
-    private fun setForceUseViaReflection(usage: Int, config: Int): ForceResult {
+    private fun setForceUseBestEffort(usage: Int, config: Int): ForceResult {
         return try {
             val audioSystem = Class.forName("android.media.AudioSystem")
             val method = audioSystem.getDeclaredMethod(
@@ -156,66 +252,51 @@ class PrivilegedServiceImpl : IPrivilegedService.Stub() {
                 Int::class.javaPrimitiveType,
             )
             method.isAccessible = true
-            val returnValue = method.invoke(null, usage, config)
-            val code = (returnValue as? Int) ?: AUDIO_STATUS_OK
-            if (code == AUDIO_STATUS_OK) {
-                ForceResult(true, "AudioSystem.setForceUse($usage,$config) -> $code")
-            } else {
-                ForceResult(false, "AudioSystem.setForceUse($usage,$config) -> error $code")
-            }
-        } catch (t: Throwable) {
-            val root = t.cause ?: t
-            ForceResult(false, "${root.javaClass.simpleName}: ${root.message ?: "no message"}")
-        }
-    }
-
-    private fun probeAudioSystemReflection(): String {
-        return try {
-            val audioSystem = Class.forName("android.media.AudioSystem")
-            audioSystem.getDeclaredMethod(
-                "setForceUse",
-                Int::class.javaPrimitiveType,
-                Int::class.javaPrimitiveType,
+            val raw = method.invoke(null, usage, config)
+            val status = (raw as? Number)?.toInt()
+            ForceResult(
+                success = status == AUDIO_STATUS_OK,
+                message = "AudioSystem.setForceUse($usage,$config) -> $status",
             )
-            "METHOD PRESENT"
         } catch (t: Throwable) {
-            "UNAVAILABLE (${(t.cause ?: t).javaClass.simpleName})"
+            Logger.e("setForceUse failed", t)
+            ForceResult(false, "${t.javaClass.simpleName}: ${t.message}")
         }
     }
 
-    private fun readForceUseSummary(): String {
-        val policy = runShell("dumpsys media.audio_policy").orEmpty()
-        val audio = runShell("dumpsys audio").orEmpty()
-        val combined = "$policy\n$audio"
-        return combined.lineSequence()
-            .filter {
-                it.contains("force use", ignoreCase = true) ||
-                it.contains("force_use", ignoreCase = true) ||
-                it.contains("communications:", ignoreCase = true) ||
-                it.contains("record:", ignoreCase = true)
-            }
-            .take(30)
-            .joinToString("\n")
-    }
-
-    private fun runShell(command: String): String? {
+    private fun runShell(command: String): String {
         return try {
-            Logger.d("PrivilegedService: executing: $command")
-            val process = Runtime.getRuntime().exec(arrayOf("sh", "-c", command))
-            val output = process.inputStream.bufferedReader().readText()
-            val error = process.errorStream.bufferedReader().readText()
-            val exitCode = process.waitFor()
+            val process = ProcessBuilder("sh", "-c", command)
+                .redirectErrorStream(true)
+                .start()
+            val output = StringBuilder()
+            val reader = Thread {
+                process.inputStream.bufferedReader().useLines { lines ->
+                    lines.forEach { output.appendLine(it) }
+                }
+            }.apply { start() }
 
-            if (exitCode == 0) {
-                output.trim()
-            } else {
-                val msg = error.ifBlank { output }.trim()
-                Logger.e("PrivilegedService: command failed (exit=$exitCode): $msg")
-                "ERROR(exit=$exitCode): $msg"
+            if (!process.waitFor(SHELL_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                reader.join(1_000L)
+                return "ERROR(timeout): command exceeded ${SHELL_TIMEOUT_SECONDS}s"
             }
-        } catch (e: Exception) {
-            Logger.e("PrivilegedService: command exception: $command", e)
-            "EXCEPTION: ${e.javaClass.simpleName}: ${e.message}"
+            reader.join(1_000L)
+            val text = output.toString().trim()
+            if (process.exitValue() == 0) text
+            else "ERROR(exit=${process.exitValue()}): $text"
+        } catch (t: Throwable) {
+            "EXCEPTION: ${t.javaClass.simpleName}: ${t.message}"
         }
+    }
+
+    companion object {
+        private val ALLOWED_PREFIXES = listOf("dumpsys audio", "cmd audio", "settings get")
+        private const val FOR_COMMUNICATION = 0
+        private const val FOR_RECORD = 2
+        private const val FORCE_NONE = 0
+        private const val FORCE_BT_SCO = 3
+        private const val AUDIO_STATUS_OK = 0
+        private const val SHELL_TIMEOUT_SECONDS = 8L
     }
 }

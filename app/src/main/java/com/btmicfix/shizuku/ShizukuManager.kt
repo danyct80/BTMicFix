@@ -4,22 +4,33 @@ import android.content.ComponentName
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.IBinder
+import android.os.SystemClock
 import com.btmicfix.BuildConfig
 import com.btmicfix.IPrivilegedService
 import com.btmicfix.util.Logger
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import rikka.shizuku.Shizuku
 
-/**
- * Manages Shizuku availability, permission and the privileged UserService.
- *
- * The previous implementation could show "Shizuku ready" while the UserService was not
- * actually bound, and the normal routing path never invoked the privileged fallback.
- * This version exposes the real service state and provides explicit force/clear methods.
- */
+/** Optional Shizuku integration. Core routing does not depend on it. */
 class ShizukuManager {
+
+    enum class ShizukuStatus {
+        UNKNOWN,
+        NOT_INSTALLED,
+        NOT_RUNNING,
+        PERMISSION_NEEDED,
+        READY,
+    }
+
+    enum class UserServiceState {
+        DISCONNECTED,
+        CONNECTING,
+        READY,
+        ERROR,
+    }
 
     private val _status = MutableStateFlow(ShizukuStatus.UNKNOWN)
     val status: StateFlow<ShizukuStatus> = _status.asStateFlow()
@@ -32,30 +43,14 @@ class ShizukuManager {
 
     private var privilegedService: IPrivilegedService? = null
     private var bindingRequested = false
-
-    enum class ShizukuStatus {
-        UNKNOWN,
-        NOT_INSTALLED,
-        NOT_RUNNING,
-        PERMISSION_NEEDED,
-        READY,
-    }
-
-    enum class UserServiceState {
-        DISCONNECTED,
-        BINDING,
-        READY,
-        ERROR,
-    }
+    @Volatile private var forcedScoApplied = false
 
     private val binderReceivedListener = Shizuku.OnBinderReceivedListener {
-        Logger.i("Shizuku binder received")
         refreshStatus()
-        ensurePrivilegedServiceBound()
+        if (_status.value == ShizukuStatus.READY) bindPrivilegedService()
     }
 
     private val binderDeadListener = Shizuku.OnBinderDeadListener {
-        Logger.w("Shizuku binder died")
         privilegedService = null
         bindingRequested = false
         _serviceState.value = UserServiceState.DISCONNECTED
@@ -65,38 +60,36 @@ class ShizukuManager {
     private val permissionResultListener =
         Shizuku.OnRequestPermissionResultListener { _, grantResult ->
             if (grantResult == PackageManager.PERMISSION_GRANTED) {
-                Logger.i("Shizuku permission granted")
                 _status.value = ShizukuStatus.READY
-                ensurePrivilegedServiceBound()
+                bindPrivilegedService()
             } else {
-                Logger.w("Shizuku permission denied")
                 _status.value = ShizukuStatus.PERMISSION_NEEDED
             }
         }
 
     fun initialize() {
-        Logger.i("Initializing ShizukuManager")
         try {
             Shizuku.addBinderReceivedListener(binderReceivedListener)
             Shizuku.addBinderDeadListener(binderDeadListener)
             Shizuku.addRequestPermissionResultListener(permissionResultListener)
             refreshStatus()
-            ensurePrivilegedServiceBound()
+            if (_status.value == ShizukuStatus.READY) bindPrivilegedService()
         } catch (e: Exception) {
-            Logger.e("Failed to initialize Shizuku listeners", e)
+            Logger.e("Failed to initialize Shizuku", e)
             _status.value = ShizukuStatus.NOT_INSTALLED
-            _serviceState.value = UserServiceState.ERROR
         }
     }
 
     fun cleanup() {
+        clearForcedBluetoothScoIfApplied()
         try {
             Shizuku.removeBinderReceivedListener(binderReceivedListener)
             Shizuku.removeBinderDeadListener(binderDeadListener)
             Shizuku.removeRequestPermissionResultListener(permissionResultListener)
         } catch (e: Exception) {
-            Logger.e("Error cleaning up Shizuku listeners", e)
+            Logger.e("Error removing Shizuku listeners", e)
         }
+        unbindPrivilegedService()
     }
 
     fun refreshStatus() {
@@ -109,120 +102,127 @@ class ShizukuManager {
                 ShizukuStatus.PERMISSION_NEEDED
             }
         } catch (e: Exception) {
-            Logger.e("Error checking Shizuku status", e)
+            Logger.e("Error checking Shizuku", e)
             ShizukuStatus.NOT_INSTALLED
         }
 
-        if (_status.value == ShizukuStatus.READY) ensurePrivilegedServiceBound()
+        if (_status.value == ShizukuStatus.READY && privilegedService == null) {
+            bindPrivilegedService()
+        }
     }
 
     fun requestPermission() {
-        if (_status.value == ShizukuStatus.NOT_INSTALLED ||
-            _status.value == ShizukuStatus.NOT_RUNNING
-        ) {
-            Logger.w("Cannot request permission — Shizuku not available")
-            return
-        }
+        if (_status.value == ShizukuStatus.NOT_RUNNING ||
+            _status.value == ShizukuStatus.NOT_INSTALLED
+        ) return
         try {
             Shizuku.requestPermission(PERMISSION_REQUEST_CODE)
         } catch (e: Exception) {
-            Logger.e("Error requesting Shizuku permission", e)
+            Logger.e("Shizuku permission request failed", e)
         }
     }
 
     fun isAvailable(): Boolean = _status.value == ShizukuStatus.READY
-    fun isPrivilegedServiceReady(): Boolean = privilegedService?.asBinder()?.pingBinder() == true
+    fun isServiceReady(): Boolean = _serviceState.value == UserServiceState.READY
 
-    /**
-     * Bind proactively. Safe to call repeatedly.
-     */
-    fun ensurePrivilegedServiceBound() {
-        if (!isAvailable()) return
-        if (isPrivilegedServiceReady()) {
-            _serviceState.value = UserServiceState.READY
+    /** Wait for the privileged UserService so diagnostics never start on an unknown force-use state. */
+    suspend fun awaitServiceReady(timeoutMs: Long = 5_000L): Boolean {
+        refreshStatus()
+        if (!isAvailable()) return false
+        if (isServiceReady() && privilegedService?.asBinder()?.pingBinder() == true) return true
+
+        bindPrivilegedService()
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs.coerceAtLeast(250L)
+        while (SystemClock.elapsedRealtime() < deadline) {
+            if (isServiceReady() && privilegedService?.asBinder()?.pingBinder() == true) return true
+            if (_serviceState.value == UserServiceState.ERROR || !isAvailable()) return false
+            delay(100L)
+        }
+        return false
+    }
+
+    fun bindPrivilegedService() {
+        if (!isAvailable() || privilegedService != null || bindingRequested) return
+        val args = buildUserServiceArgs() ?: run {
+            _serviceState.value = UserServiceState.ERROR
             return
         }
-        if (bindingRequested) return
-
         try {
-            val args = buildUserServiceArgs() ?: run {
-                _serviceState.value = UserServiceState.ERROR
-                return
-            }
             bindingRequested = true
-            _serviceState.value = UserServiceState.BINDING
+            _serviceState.value = UserServiceState.CONNECTING
             Shizuku.bindUserService(args, userServiceConnection)
-            Logger.i("Binding to PrivilegedService via Shizuku")
         } catch (e: Exception) {
             bindingRequested = false
             _serviceState.value = UserServiceState.ERROR
-            Logger.e("Failed to bind PrivilegedService", e)
+            Logger.e("Failed to bind Shizuku UserService", e)
         }
     }
-
-    fun bindPrivilegedService() = ensurePrivilegedServiceBound()
 
     fun unbindPrivilegedService() {
+        if (!bindingRequested && privilegedService == null) return
         try {
-            val args = buildUserServiceArgs() ?: return
-            Shizuku.unbindUserService(args, userServiceConnection, true)
+            buildUserServiceArgs()?.let {
+                Shizuku.unbindUserService(it, userServiceConnection, true)
+            }
         } catch (_: Exception) {
-            // May not be bound.
+        } finally {
+            privilegedService = null
+            bindingRequested = false
+            _serviceState.value = UserServiceState.DISCONNECTED
         }
-        privilegedService = null
-        bindingRequested = false
-        _serviceState.value = UserServiceState.DISCONNECTED
     }
 
-    /**
-     * ACTUAL privileged Android Auto fallback.
-     * This is intentionally explicit instead of being silently advertised as active.
-     */
     fun forceBluetoothSco(): String {
         val service = privilegedService
         if (service == null || !service.asBinder().pingBinder()) {
-            ensurePrivilegedServiceBound()
-            val msg = "Shizuku pronto, ma il servizio privilegiato non è ancora connesso. Riprova tra un secondo."
-            _lastForceResult.value = msg
-            return msg
+            bindPrivilegedService()
+            return "RESULT=FAILED\nServizio privilegiato non connesso"
         }
-
         return try {
-            val result = service.forceBluetoothSco() ?: "Nessuna risposta dal servizio privilegiato"
+            val result = service.forceBluetoothSco() ?: "RESULT=FAILED\nNessuna risposta"
+            forcedScoApplied = result.contains("RESULT=OK", ignoreCase = true) ||
+                result.contains("RESULT=FAILED_DIRTY", ignoreCase = true)
             _lastForceResult.value = result
-            Logger.i("Shizuku SCO force result:\n$result")
             result
         } catch (e: Exception) {
             _serviceState.value = UserServiceState.ERROR
-            val result = "ERRORE Shizuku: ${e.javaClass.simpleName}: ${e.message}"
+            val result = "RESULT=FAILED\n${e.javaClass.simpleName}: ${e.message}"
             _lastForceResult.value = result
-            Logger.e("forceBluetoothSco failed", e)
             result
         }
-    }
-
-    fun clearLastForceResult() {
-        _lastForceResult.value = null
     }
 
     fun clearForcedBluetoothSco(): String {
         val service = privilegedService
         if (service == null || !service.asBinder().pingBinder()) {
-            return "Servizio privilegiato non connesso"
+            return "RESULT=CLEAR_FAILED\nServizio privilegiato non connesso"
         }
         return try {
-            val result = service.clearForcedBluetoothSco() ?: "Nessuna risposta"
+            val result = service.clearForcedBluetoothSco() ?: "RESULT=CLEAR_FAILED\nNessuna risposta"
+            if (result.contains("RESULT=CLEARED", ignoreCase = true)) {
+                forcedScoApplied = false
+            }
             _lastForceResult.value = result
             result
         } catch (e: Exception) {
-            "ERRORE clear Shizuku: ${e.javaClass.simpleName}: ${e.message}"
+            _serviceState.value = UserServiceState.ERROR
+            val result = "RESULT=CLEAR_FAILED\n${e.javaClass.simpleName}: ${e.message}"
+            _lastForceResult.value = result
+            result
         }
     }
+
+    fun clearForcedBluetoothScoIfApplied(): String {
+        if (!forcedScoApplied) return "Nessuna forzatura SCO attiva"
+        return clearForcedBluetoothSco()
+    }
+
+    fun isForcedBluetoothScoApplied(): Boolean = forcedScoApplied
 
     fun getRoutingCapabilities(): String {
         val service = privilegedService
         if (service == null || !service.asBinder().pingBinder()) {
-            ensurePrivilegedServiceBound()
+            bindPrivilegedService()
             return "Servizio privilegiato non ancora connesso"
         }
         return try {
@@ -232,45 +232,13 @@ class ShizukuManager {
         }
     }
 
-    fun executeShellCommand(command: String): String? {
-        val service = privilegedService ?: run {
-            ensurePrivilegedServiceBound()
-            return null
-        }
-        return try {
-            service.executeAudioCommand(command)
-        } catch (e: Exception) {
-            Logger.e("Shell command exception: $command", e)
-            null
-        }
-    }
-
     fun getAudioDiagnostics(): String? {
         val service = privilegedService ?: return null
-        return try {
-            service.audioDump
-        } catch (e: Exception) {
-            Logger.e("Error getting audio diagnostics", e)
-            null
-        }
+        return try { service.audioDump } catch (_: Exception) { null }
     }
 
-    private fun buildUserServiceArgs(): Shizuku.UserServiceArgs? {
-        return try {
-            Shizuku.UserServiceArgs(
-                ComponentName(
-                    BuildConfig.APPLICATION_ID,
-                    PrivilegedServiceImpl::class.java.name,
-                )
-            )
-                .daemon(true)
-                .processNameSuffix("privileged")
-                .debuggable(BuildConfig.DEBUG)
-                .version(BuildConfig.VERSION_CODE)
-        } catch (e: Exception) {
-            Logger.e("Could not build Shizuku UserService args", e)
-            null
-        }
+    fun clearLastForceResult() {
+        _lastForceResult.value = null
     }
 
     private val userServiceConnection = object : ServiceConnection {
@@ -279,11 +247,9 @@ class ShizukuManager {
             if (binder != null && binder.pingBinder()) {
                 privilegedService = IPrivilegedService.Stub.asInterface(binder)
                 _serviceState.value = UserServiceState.READY
-                Logger.i("PrivilegedService connected")
             } else {
                 privilegedService = null
                 _serviceState.value = UserServiceState.ERROR
-                Logger.e("PrivilegedService connection returned invalid binder")
             }
         }
 
@@ -291,15 +257,20 @@ class ShizukuManager {
             privilegedService = null
             bindingRequested = false
             _serviceState.value = UserServiceState.DISCONNECTED
-            Logger.w("PrivilegedService disconnected")
         }
+    }
 
-        override fun onBindingDied(name: ComponentName?) {
-            privilegedService = null
-            bindingRequested = false
-            _serviceState.value = UserServiceState.ERROR
-            Logger.w("PrivilegedService binding died")
-        }
+    private fun buildUserServiceArgs(): Shizuku.UserServiceArgs? = try {
+        Shizuku.UserServiceArgs(
+            ComponentName(BuildConfig.APPLICATION_ID, PrivilegedServiceImpl::class.java.name)
+        )
+            .daemon(false)
+            .processNameSuffix("privileged")
+            .debuggable(BuildConfig.DEBUG)
+            .version(BuildConfig.VERSION_CODE)
+    } catch (e: Exception) {
+        Logger.e("Could not build Shizuku UserService args", e)
+        null
     }
 
     companion object {

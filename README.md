@@ -1,151 +1,50 @@
-**W622 diagnostic branch: 0.5.3-stable-identity**
+# BTMicFix — W622 / Bluetooth microphone diagnostic build
 
-W622 diagnostic build: **0.5.3-stable-identity**. Device identity is based on the Companion association/MAC, never on a cached friendly name. Microphone TEST buttons remain passive: they measure the already-active priority Bluetooth device without re-negotiating SCO.
+BTMicFix is an Android utility for selecting one explicit Bluetooth communication device, requesting microphone routing through it, and verifying the **real input used by Android**.
 
-# BTMicFix
+## This build
 
-**Fix Bluetooth earbuds microphone routing for AI voice apps on Android.**
+Version **0.6.5-final-audit**.
 
-AI voice apps like ChatGPT, Claude, and Gemini often fail to switch your Bluetooth earbuds from music mode (A2DP) to hands-free mode (SCO/HFP), causing them to use your phone's built-in microphone instead of your earbuds' mic. BTMicFix forces this switch automatically.
+The app is designed around one user-selected priority device. It never falls back to the first Bluetooth device it finds. The Bluetooth list on the home screen is informational only.
 
-## How It Works
+### Unified diagnostic
 
-BTMicFix uses Android's `setCommunicationDevice()` API (Android 12+) to force the system to route communication audio through your Bluetooth earbuds. This triggers the A2DP → SCO/HFP profile switch that AI apps fail to perform on their own.
+The **Diagnostica completa** flow performs, in one run:
 
-### Three Layers
+- confirmation of the real `AudioManager.communicationDevice`;
+- `VOICE_COMMUNICATION`, `VOICE_RECOGNITION`, and `MIC` captures using the active Android route;
+- the same three sources with `AudioRecord.setPreferredDevice()` when the target input can be identified safely;
+- verification of `AudioRecord.routedDevice` while recording is active;
+- real PCM level measurement with silence calibration, RMS/peak thresholds, and explicit PASS/NO_AUDIO/WRONG_DEVICE/INDETERMINATE results;
+- optional Shizuku force-use verification, one real forced `VOICE_RECOGNITION` capture, and restoration of the original force-use policy.
 
-| Layer | Purpose | Requires |
-|---|---|---|
-| **Audio Routing** (primary) | Forces BT mic via `setCommunicationDevice()` | Nothing — public API |
-| **Background Service** | Auto-activates when earbuds connect via Companion Device Manager | One-time pairing in app |
-| **Shizuku Fallback** (optional) | Privileged shell commands for stubborn devices | [Shizuku](https://shizuku.rikka.app/) installed |
+Shizuku is optional. Core routing uses public Android audio APIs.
 
 ## Requirements
 
-- Android 12+ (API 31+)
-- Bluetooth earbuds paired with your device
-- No root required
+- Android 13 or newer (**API 33+**)
+- Bluetooth communication device paired with the phone
+- `BLUETOOTH_CONNECT` permission
+- `RECORD_AUDIO` permission for microphone diagnostics
+- Shizuku only for the optional privileged fallback/diagnostic
 
-## Building
+## Build
+
+The repository includes a GitHub Actions workflow that builds the debug APK with JDK 17.
+
+Local command:
 
 ```bash
-# Clone the repo
-git clone https://github.com/Endda/btmicfix.git
-cd btmicfix
-
-# Build the debug APK
 ./gradlew assembleDebug
-
-# Install on connected device
-adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-## Usage
+The app module writes build output under `app/build_tmp/`.
 
-1. **Install** the APK on your Android device
-2. **Grant Bluetooth permission** when prompted
-3. **Pair your earbuds** in the Setup wizard (for automatic background mode)
-4. **Tap "Enable Routing"** on the home screen
-5. **Open your AI app** — your earbuds' microphone should now work
+## Safety / routing rules
 
-For automatic background mode, complete the pairing step. BTMicFix will then activate whenever your earbuds connect, even without opening the app.
-
-## Shizuku (Optional)
-
-Some devices or Android versions may not respond to the standard `setCommunicationDevice()` API. For these cases, BTMicFix can optionally use [Shizuku](https://shizuku.rikka.app/) to execute privileged audio routing commands. This is **not required** for most users.
-
-## Project Structure
-
-```
-app/src/main/java/com/btmicfix/
-├── BTMicFixApp.kt              # Application class
-├── MainActivity.kt             # Single activity entry point
-├── audio/
-│   ├── AudioRoutingManager.kt  # Core routing logic (setCommunicationDevice)
-│   └── BluetoothStateReceiver.kt # BT connect/disconnect listener
-├── companion/
-│   ├── DeviceCompanionManager.kt # CDM association management
-│   └── BTCompanionService.kt    # Background auto-routing service
-├── shizuku/
-│   ├── ShizukuManager.kt       # Shizuku lifecycle & permissions
-│   └── PrivilegedServiceImpl.kt # Privileged command execution
-├── ui/
-│   ├── components/             # Reusable Compose components
-│   ├── screens/                # HomeScreen, SetupScreen
-│   └── theme/                  # Material 3 dark theme
-└── util/
-    ├── Preferences.kt          # SharedPreferences wrapper
-    └── Logger.kt               # Centralized logging
-```
-
-## Tech Stack
-
-- **Language:** Kotlin
-- **UI:** Jetpack Compose + Material 3
-- **Audio:** AudioManager (API 31+)
-- **Background:** CompanionDeviceManager + CompanionDeviceService
-- **Optional:** Shizuku API 13.1.5
-
-## Contributing
-
-Contributions are welcome! Please open an issue first to discuss what you'd like to change.
-
-## License
-
-```
-Copyright 2026 BTMicFix Contributors
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-```
-
----
-
-## Android Auto / W622 experimental Shizuku fallback (0.2.0-aa)
-
-This fork adds an explicit privileged fallback for the motorcycle Android Auto case where
-`setCommunicationDevice()` reports success but Gemini/Assistant still loses the Bluetooth mic.
-
-### What changed
-
-- Shizuku now binds a real UserService and reports whether that service is actually connected.
-- Added **FORZA CARDO ORA (SHIZUKU)**:
-  1. re-asserts the selected Bluetooth SCO communication device;
-  2. attempts to force Android audio policy `FOR_COMMUNICATION` and `FOR_RECORD` to `FORCE_BT_SCO`.
-- Added **LOCK ROUTING PER 30 SECONDI** to re-assert both routes every 500 ms while Android Auto
-  may be stealing the route during Assistant activation.
-- Privileged routing reports exactly which mechanism succeeded or failed instead of showing a
-  misleading "fallback active" state.
-- The privileged service first tries hidden `AudioSystem.setForceUse()` from the Shizuku shell
-  process, then falls back to `cmd audio set-force-use` only when the ROM exposes that command.
-- Added policy verification from `dumpsys audio` / `dumpsys media.audio_policy`.
-
-### Recommended test sequence
-
-1. Start Shizuku and grant BTMicFix permission.
-2. Connect Android Auto to the W622.
-3. Connect the Bluetooth headset/intercom to the phone.
-4. In BTMicFix select the headset/intercom as the priority Bluetooth device (BT SCO).
-5. Confirm the Shizuku card says **servizio privilegiato connesso**.
-6. Tap **LOCK ROUTING PER 30 SECONDI**.
-7. During those 30 seconds invoke Gemini/Assistant from the headset/intercom and speak into its microphone.
-8. Read the diagnostic result shown in BTMicFix. If it says the ROM blocks both reflection and
-   `cmd audio set-force-use`, the limitation is below the normal app/Shizuku routing layer.
-
-This is experimental and intentionally does not use root.
-
-
-### Multi-source microphone diagnostics
-The W622/Android Auto diagnostic fork can test the Bluetooth microphone independently with `VOICE_COMMUNICATION`, `VOICE_RECOGNITION`, and `MIC`. Each test first calibrates background noise for about 1.2 seconds, then measures speech. The home screen shows a live level meter, dBFS/RMS volume and the calculated minimum threshold. PASS requires both a matching Bluetooth routed input and voice above threshold. Audio is analyzed in memory only and is never saved.
-
-### Priority companion device
-Only one companion device is treated as the automatic microphone target. Selecting a new priority device replaces previous app associations. Legacy duplicate associations can be removed individually from Setup. Automatic routing and background callbacks ignore non-priority devices such as an Android Auto head unit.
+- Priority identity uses Companion Device Manager association ID and Bluetooth address; friendly names are secondary hints only.
+- No hardcoded headset/head-unit names are used.
+- Microphone test functions do not call `AudioManager.setCommunicationDevice()` and do not invoke Shizuku themselves.
+- If Android cannot prove which Bluetooth input was used, the test reports `INDETERMINATE` instead of a false PASS.
+- Shizuku force-use state is snapshotted and restored; partial force operations attempt immediate rollback.

@@ -19,13 +19,13 @@ import com.btmicfix.ui.screens.SetupScreen
 import com.btmicfix.ui.theme.BTMicFixTheme
 import com.btmicfix.util.Logger
 import com.btmicfix.util.Preferences
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
-/**
- * Main (and only) Activity for BTMicFix.
- *
- * Manages the lifecycle of core managers and provides them to the Compose UI.
- * Uses simple screen-state navigation (no Jetpack Navigation — overkill for 2 screens).
- */
 class MainActivity : ComponentActivity(), BluetoothStateReceiver.BluetoothConnectionListener {
 
     private lateinit var audioRoutingManager: AudioRoutingManager
@@ -33,27 +33,23 @@ class MainActivity : ComponentActivity(), BluetoothStateReceiver.BluetoothConnec
     private lateinit var companionManager: DeviceCompanionManager
     private lateinit var preferences: Preferences
     private val btReceiver = BluetoothStateReceiver()
+    private val activityScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var foregroundRoutingJob: Job? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        // Initialize managers
         audioRoutingManager = AudioRoutingManager(this)
         shizukuManager = ShizukuManager()
         companionManager = DeviceCompanionManager(this)
         preferences = Preferences(this)
 
-        // Reconcile persisted priority before any routing/background observation.
-        // Old/stale preferences must never resurrect a previously selected headset.
         companionManager.reconcilePriority()
-
-        // Start monitoring
         audioRoutingManager.startMonitoring()
         shizukuManager.initialize()
         companionManager.resumeObservingPriorityAssociation()
 
-        // Register BT state listener
         BluetoothStateReceiver.listener = this
         registerReceiver(
             btReceiver,
@@ -61,47 +57,37 @@ class MainActivity : ComponentActivity(), BluetoothStateReceiver.BluetoothConnec
             Context.RECEIVER_EXPORTED,
         )
 
-        Logger.i("MainActivity created, all managers initialized")
-
         setContent {
             BTMicFixTheme {
-                var currentScreen by remember {
-                    mutableStateOf(
-                        if (preferences.setupCompleted) Screen.Home else Screen.Setup
-                    )
+                var screen by remember {
+                    mutableStateOf(if (preferences.setupCompleted) Screen.Home else Screen.Setup)
                 }
-
-                when (currentScreen) {
-                    Screen.Home -> {
-                        HomeScreen(
-                            audioRoutingManager = audioRoutingManager,
-                            shizukuManager = shizukuManager,
-                            companionManager = companionManager,
-                            onSetupClick = { currentScreen = Screen.Setup },
-                            onDetailsClick = { currentScreen = Screen.Details },
-                            modifier = Modifier.fillMaxSize(),
-                        )
-                    }
-                    Screen.Setup -> {
-                        SetupScreen(
-                            audioRoutingManager = audioRoutingManager,
-                            shizukuManager = shizukuManager,
-                            companionManager = companionManager,
-                            onBackClick = {
-                                preferences.setupCompleted = true
-                                currentScreen = Screen.Home
-                            },
-                            modifier = Modifier.fillMaxSize(),
-                        )
-                    }
-                    Screen.Details -> {
-                        DetailsScreen(
-                            audioRoutingManager = audioRoutingManager,
-                            shizukuManager = shizukuManager,
-                            onBackClick = { currentScreen = Screen.Home },
-                            modifier = Modifier.fillMaxSize(),
-                        )
-                    }
+                when (screen) {
+                    Screen.Home -> HomeScreen(
+                        audioRoutingManager = audioRoutingManager,
+                        shizukuManager = shizukuManager,
+                        companionManager = companionManager,
+                        onSetupClick = { screen = Screen.Setup },
+                        onDetailsClick = { screen = Screen.Details },
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                    Screen.Setup -> SetupScreen(
+                        audioRoutingManager = audioRoutingManager,
+                        shizukuManager = shizukuManager,
+                        companionManager = companionManager,
+                        preferences = preferences,
+                        onBackClick = {
+                            preferences.setupCompleted = true
+                            screen = Screen.Home
+                        },
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                    Screen.Details -> DetailsScreen(
+                        audioRoutingManager = audioRoutingManager,
+                        shizukuManager = shizukuManager,
+                        onBackClick = { screen = Screen.Home },
+                        modifier = Modifier.fillMaxSize(),
+                    )
                 }
             }
         }
@@ -109,56 +95,42 @@ class MainActivity : ComponentActivity(), BluetoothStateReceiver.BluetoothConnec
 
     override fun onResume() {
         super.onResume()
-        // Refresh states when returning to the app and drop any stale priority state.
         companionManager.reconcilePriority()
         shizukuManager.refreshStatus()
     }
 
     override fun onDestroy() {
-        super.onDestroy()
         BluetoothStateReceiver.listener = null
-        try {
-            unregisterReceiver(btReceiver)
-        } catch (e: Exception) {
-            // Receiver may not be registered
-        }
+        try { unregisterReceiver(btReceiver) } catch (_: Exception) {}
         audioRoutingManager.stopMonitoring()
+        foregroundRoutingJob?.cancel()
+        foregroundRoutingJob = null
         shizukuManager.cleanup()
-        Logger.i("MainActivity destroyed")
+        activityScope.cancel()
+        super.onDestroy()
     }
 
-    // -- BluetoothConnectionListener --
-
     override fun onBluetoothDeviceConnected(device: BluetoothDevice) {
-        val deviceName = try { device.name } catch (_: SecurityException) { null }
-        if (preferences.autoRouteEnabled && preferences.isPreferredDevice(device.address, deviceName)) {
-            Logger.i("Auto-routing triggered by PRIORITY BT device connect")
-            val priority = companionManager.getPriorityDevice()
-            audioRoutingManager.routeToPreferredBluetooth(
-                priority?.address,
-                priority?.name,
+        if (!preferences.autoRouteEnabled || !preferences.isPreferredDevice(device.address)) return
+        foregroundRoutingJob?.cancel()
+        foregroundRoutingJob = activityScope.launch {
+            val priority = companionManager.getPriorityDevice() ?: return@launch
+            audioRoutingManager.routeToPreferredBluetoothAndWait(
+                priority.address,
+                priority.routingName,
             )
-        } else {
-            Logger.d("Ignoring non-priority BT connection: ${deviceName ?: "unknown"}")
         }
     }
 
     override fun onBluetoothDeviceDisconnected(device: BluetoothDevice) {
-        val deviceName = try { device.name } catch (_: SecurityException) { null }
-        if (preferences.isPreferredDevice(device.address, deviceName)) {
-            Logger.i("Priority BT device disconnected, clearing routing")
-            audioRoutingManager.clearRouting()
-        } else {
-            Logger.d("Ignoring non-priority BT disconnect: ${deviceName ?: "unknown"}")
-        }
+        if (!preferences.isPreferredDevice(device.address)) return
+        // Cancel a foreground request that may still be waiting for Android to switch.
+        // routeToPreferredBluetoothAndWait() performs its own cancellation cleanup.
+        foregroundRoutingJob?.cancel()
+        foregroundRoutingJob = null
+        val priority = companionManager.getPriorityDevice()
+        audioRoutingManager.clearRoutingIfPreferred(priority?.address, priority?.routingName)
     }
 
-    /**
-     * Simple screen enum — no need for Jetpack Navigation with only 2 screens.
-     */
-    private enum class Screen {
-        Home,
-        Setup,
-        Details,
-    }
+    private enum class Screen { Home, Setup, Details }
 }

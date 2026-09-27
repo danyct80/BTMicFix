@@ -4,7 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import androidx.core.content.edit
 
-/** Simple SharedPreferences wrapper for persisting user settings. */
+/** Persistent app configuration. Device identity is association-id/MAC based. */
 class Preferences(context: Context) {
 
     private val prefs: SharedPreferences =
@@ -20,10 +20,6 @@ class Preferences(context: Context) {
         private const val NO_ASSOCIATION_ID = -1
     }
 
-    /**
-     * Stable Companion Device association id. This is the primary identity inside BTMicFix.
-     * Device names are display-only and must never be used as the authoritative identity.
-     */
     var pairedAssociationId: Int?
         get() = prefs.getInt(KEY_PAIRED_ASSOCIATION_ID, NO_ASSOCIATION_ID)
             .takeIf { it != NO_ASSOCIATION_ID }
@@ -32,7 +28,6 @@ class Preferences(context: Context) {
             else putInt(KEY_PAIRED_ASSOCIATION_ID, value)
         }
 
-    /** Bluetooth MAC, used to match real Bluetooth connection events and AudioDeviceInfo when exposed. */
     var pairedDeviceAddress: String?
         get() = prefs.getString(KEY_PAIRED_DEVICE_ADDRESS, null)
         set(value) = prefs.edit {
@@ -40,10 +35,7 @@ class Preferences(context: Context) {
             else putString(KEY_PAIRED_DEVICE_ADDRESS, value)
         }
 
-    /**
-     * Last known friendly name. DISPLAY CACHE ONLY.
-     * It is refreshed from Android/CDM/Bluetooth and is never authoritative for identity.
-     */
+    /** Human-readable routing hint only; never used as the primary identity. */
     var pairedDeviceName: String?
         get() = prefs.getString(KEY_PAIRED_DEVICE_NAME, null)
         set(value) = prefs.edit {
@@ -66,18 +58,16 @@ class Preferences(context: Context) {
     fun hasPreferredDevice(): Boolean =
         pairedAssociationId != null || !pairedDeviceAddress.isNullOrBlank()
 
-    /** Strict identity for a CDM association. */
     fun isPreferredAssociation(associationId: Int, address: String?): Boolean {
         pairedAssociationId?.let { return it == associationId }
-
         val preferredAddress = pairedDeviceAddress
         return !preferredAddress.isNullOrBlank() &&
             !address.isNullOrBlank() &&
             preferredAddress.equals(address, ignoreCase = true)
     }
 
-    /** Strict identity for a BluetoothDevice connection event. Never match by a stale display name. */
-    fun isPreferredDevice(address: String?, name: String? = null): Boolean {
+    /** Strict Bluetooth connection identity. Never fall back to a stale display name. */
+    fun isPreferredDevice(address: String?): Boolean {
         val preferredAddress = pairedDeviceAddress
         return !preferredAddress.isNullOrBlank() &&
             !address.isNullOrBlank() &&
@@ -92,7 +82,6 @@ class Preferences(context: Context) {
         }
     }
 
-    /** Clears only BTMicFix configuration; Bluetooth pairings are not touched. */
     fun resetAppConfiguration() {
         prefs.edit { clear() }
     }
