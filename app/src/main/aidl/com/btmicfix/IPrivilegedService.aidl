@@ -8,4 +8,6 @@ interface IPrivilegedService {
     String forceBluetoothSco() = 4;
     String clearForcedBluetoothSco() = 5;
     String getRoutingCapabilities() = 6;
+    String inspectVoiceExclusionCapabilities() = 7;
+    String testVoiceDeviceExclusion(int publicType, String address, String name, int durationMs) = 8;
 }

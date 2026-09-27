@@ -30,6 +30,7 @@ fun DetailsScreen(
     val devices by audioRoutingManager.availableDevices.collectAsState()
     val results by audioRoutingManager.allMicTestResults.collectAsState()
     val shizukuResult by shizukuManager.lastForceResult.collectAsState()
+    val exclusionResult by shizukuManager.lastExclusionResult.collectAsState()
 
     Scaffold(
         modifier = modifier,
@@ -55,6 +56,8 @@ fun DetailsScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             CodeCard("Routing state", routingState.toString())
+            CodeCard("BTMicFix request outstanding", audioRoutingManager.isRouteRequestOutstanding().toString())
+            CodeCard("Audio mode osservato", audioRoutingManager.currentAudioModeLabel())
             CodeCard("Communication device", audioRoutingManager.currentCommunicationDeviceLabel())
             CodeCard(
                 "Communication devices disponibili",
@@ -85,6 +88,7 @@ fun DetailsScreen(
                 results[forcedKey]?.details ?: "Non eseguito in questa sessione",
             )
             CodeCard("Ultimo Shizuku force/clear", shizukuResult ?: "Non eseguito")
+            CodeCard("Ultimo test inverso DEVICE_ROLE_DISABLED", exclusionResult ?: "Non eseguito")
             Spacer(modifier = Modifier.height(20.dp))
         }
     }

@@ -165,7 +165,7 @@ fun SetupScreen(
                                         val old = companionManager.getPriorityDevice()
                                         if (companionManager.makeExclusivePriority(device.associationId)) {
                                             old?.let {
-                                                audioRoutingManager.clearRoutingIfPreferred(it.address, it.routingName)
+                                                audioRoutingManager.deactivatePreferredRoute(suppressAutoRouteUntilDisconnect = false)
                                             }
                                             shizukuManager.clearForcedBluetoothScoIfApplied()
                                             audioRoutingManager.clearMicDiagnostics()
@@ -179,7 +179,7 @@ fun SetupScreen(
                                     val target = device
                                     val removed = companionManager.removeAssociation(device.associationId)
                                     if (removed && target.isPriority) {
-                                        audioRoutingManager.clearRoutingIfPreferred(target.address, target.routingName)
+                                        audioRoutingManager.deactivatePreferredRoute(suppressAutoRouteUntilDisconnect = false)
                                         shizukuManager.clearForcedBluetoothScoIfApplied()
                                         audioRoutingManager.clearMicDiagnostics()
                                     }
@@ -197,7 +197,7 @@ fun SetupScreen(
                             companionManager.startAssociation(cdmLauncher) {
                                 val current = companionManager.getPriorityDevice()
                                 if (previous != null && previous.associationId != current?.associationId) {
-                                    audioRoutingManager.clearRoutingIfPreferred(previous.address, previous.routingName)
+                                    audioRoutingManager.deactivatePreferredRoute(suppressAutoRouteUntilDisconnect = false)
                                     shizukuManager.clearForcedBluetoothScoIfApplied()
                                     audioRoutingManager.clearMicDiagnostics()
                                 }
@@ -214,7 +214,7 @@ fun SetupScreen(
                             companionManager.resetAssociationsAndPriority()
                             val remainingPriority = companionManager.getPriorityDevice()
                             if (old != null && remainingPriority?.associationId != old.associationId) {
-                                audioRoutingManager.clearRoutingIfPreferred(old.address, old.routingName)
+                                audioRoutingManager.deactivatePreferredRoute(suppressAutoRouteUntilDisconnect = false)
                                 shizukuManager.clearForcedBluetoothScoIfApplied()
                                 audioRoutingManager.clearMicDiagnostics()
                             }
@@ -243,28 +243,40 @@ fun SetupScreen(
             }
 
             val priority = companionManager.getPriorityDevice()
+            val requestOutstanding = audioRoutingManager.isRouteRequestOutstanding()
             Button(
                 onClick = {
-                    scope.launch {
-                        audioRoutingManager.routeToPreferredBluetoothAndWait(
-                            priority?.address,
-                            priority?.routingName,
-                        )
+                    if (requestOutstanding) {
+                        audioRoutingManager.deactivatePreferredRoute()
+                    } else {
+                        scope.launch {
+                            audioRoutingManager.requestPreferredRoute(
+                                address = priority?.address,
+                                name = priority?.routingName,
+                                displayName = priority?.name,
+                                trigger = com.btmicfix.audio.RoutingPolicy.Trigger.USER_ENABLE,
+                            )
+                        }
                     }
                 },
-                enabled = priority != null &&
-                    routingState !is AudioRoutingManager.RoutingState.Routing,
+                enabled = priority != null,
                 modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = Purple40),
             ) {
                 Text(
-                    if (routingState is AudioRoutingManager.RoutingState.Active)
-                        "Routing confermato: ${(routingState as AudioRoutingManager.RoutingState.Active).deviceName}"
-                    else "Verifica routing"
+                    when (routingState) {
+                        is AudioRoutingManager.RoutingState.Active ->
+                            "Preferenza attiva: ${(routingState as AudioRoutingManager.RoutingState.Active).deviceName}"
+                        is AudioRoutingManager.RoutingState.Yielded ->
+                            "Preferenza attiva — controllo ceduto temporaneamente"
+                        is AudioRoutingManager.RoutingState.Requested ->
+                            "Preferenza registrata"
+                        else -> "Attiva preferenza Bluetooth"
+                    }
                 )
             }
             Text(
-                "Il test sopra verifica solo la route di comunicazione. Il microfono reale viene verificato dalla Diagnostica completa nella schermata principale.",
+                "La preferenza viene richiesta una sola volta e BTMicFix non imposta la modalita audio. Telefono, VoIP e assistente possono quindi prendere temporaneamente priorita senza essere contrastati. Il microfono reale viene verificato dalla Diagnostica completa nella schermata principale.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

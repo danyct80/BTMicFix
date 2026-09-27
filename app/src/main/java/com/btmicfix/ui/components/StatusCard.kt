@@ -43,17 +43,23 @@ fun StatusCard(
             title = "Inattivo",
             subtitle = "Nessun dispositivo prioritario instradato",
         )
-        is RoutingState.Routing -> StatusInfo(
+        is RoutingState.Requested -> StatusInfo(
             color = StatusRouting,
             icon = Icons.Default.BluetoothConnected,
-            title = "Instradamento…",
-            subtitle = "Connessione a ${routingState.deviceName}",
+            title = "Preferenza registrata",
+            subtitle = "Android ha accettato ${routingState.deviceName}; attendo la route effettiva",
         )
         is RoutingState.Active -> StatusInfo(
             color = StatusActive,
             icon = Icons.Default.Mic,
-            title = "Routing attivo",
+            title = "Preferenza Bluetooth attiva",
             subtitle = "Dispositivo di comunicazione: ${routingState.deviceName}",
+        )
+        is RoutingState.Yielded -> StatusInfo(
+            color = StatusRouting,
+            icon = Icons.Default.BluetoothConnected,
+            title = "Controllo audio ceduto",
+            subtitle = "${routingState.deviceName} resta preferito; ora usa ${routingState.currentDevice} (${routingState.audioMode})",
         )
         is RoutingState.Failed -> StatusInfo(
             color = StatusFailed,

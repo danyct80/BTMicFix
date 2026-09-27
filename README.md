@@ -1,50 +1,74 @@
-# BTMicFix — W622 / Bluetooth microphone diagnostic build
+# BTMicFix 0.7.0 — Logic Core
 
-BTMicFix is an Android utility for selecting one explicit Bluetooth communication device, requesting microphone routing through it, and verifying the **real input used by Android**.
+BTMicFix is an Android utility for selecting one explicit Bluetooth communication device and verifying the real microphone input used by Android.
 
-## This build
+## Routing architecture in 0.7.0
 
-Version **0.6.5-final-audit**.
+The 0.7 branch changes the routing model completely:
 
-The app is designed around one user-selected priority device. It never falls back to the first Bluetooth device it finds. The Bluetooth list on the home screen is informational only.
+- one process-wide `AudioRoutingManager` is shared by the Activity and CompanionDeviceService;
+- BTMicFix places **one** `AudioManager.setCommunicationDevice()` request;
+- BTMicFix **never calls `AudioManager.setMode()`**;
+- there is **no route-hold loop**, timer reassertion, or routing reaction to audio-mode changes;
+- phone calls, VoIP apps and voice assistants are allowed to take temporary priority;
+- when another audio owner takes the communication route, BTMicFix reports `Yielded` and does nothing;
+- when Android gives the route back, BTMicFix observes it and returns to `Active` without another request;
+- explicit disable/configuration changes are the only normal operations that call `clearCommunicationDevice()`;
+- a physical target disconnect clears only BTMicFix's logical request state after a debounced Companion Device callback.
 
-### Unified diagnostic
+This follows Android's communication-device arbitration model: simultaneous requests are prioritized by the application controlling the audio mode. BTMicFix intentionally does not try to become that owner.
 
-The **Diagnostica completa** flow performs, in one run:
+## Logic tests
 
-- confirmation of the real `AudioManager.communicationDevice`;
-- `VOICE_COMMUNICATION`, `VOICE_RECOGNITION`, and `MIC` captures using the active Android route;
-- the same three sources with `AudioRecord.setPreferredDevice()` when the target input can be identified safely;
-- verification of `AudioRecord.routedDevice` while recording is active;
-- real PCM level measurement with silence calibration, RMS/peak thresholds, and explicit PASS/NO_AUDIO/WRONG_DEVICE/INDETERMINATE results;
-- optional Shizuku force-use verification, one real forced `VOICE_RECOGNITION` capture, and restoration of the original force-use policy.
+`RoutingPolicy` is a pure Kotlin policy layer with unit tests for:
 
-Shizuku is optional. Core routing uses public Android audio APIs.
+- one-shot user activation;
+- auto-route only on device appearance/app resume;
+- no reassertion after communication-device changes;
+- no reassertion after audio-mode changes;
+- no timer-based route hold;
+- assistant/phone takeover represented as `Yielded`;
+- route return represented as `Active` without issuing another request;
+- auto-route disabled behavior;
+- disconnected-target behavior.
+
+GitHub Actions runs `testDebugUnitTest` before building the APK.
+
+## Unified microphone diagnostic
+
+The complete diagnostic performs:
+
+- one-shot route request if no request already exists;
+- real `VOICE_COMMUNICATION`, `VOICE_RECOGNITION`, and `MIC` captures;
+- each source once using the active Android route and once with `AudioRecord.setPreferredDevice()`;
+- verification of `AudioRecord.routedDevice` while recording;
+- real PCM RMS/peak analysis with silence calibration and conservative identity checks;
+- optional Shizuku force-use diagnostic isolated from normal routing;
+- guaranteed Shizuku cleanup;
+- restoration of the pre-diagnostic BTMicFix request state.
+
+Shizuku is **never used by normal routing**.
 
 ## Requirements
 
-- Android 13 or newer (**API 33+**)
+- Android 13+ (API 33+)
 - Bluetooth communication device paired with the phone
-- `BLUETOOTH_CONNECT` permission
-- `RECORD_AUDIO` permission for microphone diagnostics
-- Shizuku only for the optional privileged fallback/diagnostic
+- `BLUETOOTH_CONNECT`
+- `RECORD_AUDIO` for diagnostics
+- Shizuku only for optional privileged diagnostics
 
 ## Build
 
-The repository includes a GitHub Actions workflow that builds the debug APK with JDK 17.
-
-Local command:
+GitHub Actions uses JDK 17 and runs:
 
 ```bash
-./gradlew assembleDebug
+./gradlew testDebugUnitTest --stacktrace
+./gradlew assembleDebug --stacktrace
 ```
 
-The app module writes build output under `app/build_tmp/`.
+Build output is under `app/build_tmp/`.
 
-## Safety / routing rules
 
-- Priority identity uses Companion Device Manager association ID and Bluetooth address; friendly names are secondary hints only.
-- No hardcoded headset/head-unit names are used.
-- Microphone test functions do not call `AudioManager.setCommunicationDevice()` and do not invoke Shizuku themselves.
-- If Android cannot prove which Bluetooth input was used, the test reports `INDETERMINATE` instead of a false PASS.
-- Shizuku force-use state is snapshotted and restored; partial force operations attempt immediate rollback.
+## 0.8.0 - Inverse Exclusion Probe
+
+Adds a temporary Shizuku diagnostic that does the opposite of positive routing: it attempts to mark a selected head unit DEVICE_ROLE_DISABLED only for AudioProductStrategy entries matching VOICE_COMMUNICATION and ASSISTANT. The test never targets media strategies, snapshots any pre-existing disabled-role lists, runs for 20 seconds, and restores the exact previous policy in finally.

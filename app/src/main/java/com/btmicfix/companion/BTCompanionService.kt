@@ -11,6 +11,7 @@ import androidx.core.app.NotificationCompat
 import com.btmicfix.BTMicFixApp
 import com.btmicfix.MainActivity
 import com.btmicfix.audio.AudioRoutingManager
+import com.btmicfix.audio.RoutingPolicy
 import com.btmicfix.util.Logger
 import com.btmicfix.util.Preferences
 import kotlinx.coroutines.CoroutineScope
@@ -19,9 +20,14 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 
-/** Background zero-touch routing for the single priority companion device. */
+/**
+ * Keeps the process alive while the priority companion device is present and places ONE
+ * auto-routing request when the device appears. It never re-asserts the route after another app
+ * (phone, VoIP, assistant) takes temporary audio ownership.
+ */
 class BTCompanionService : CompanionDeviceService() {
 
     private lateinit var audioRoutingManager: AudioRoutingManager
@@ -30,6 +36,7 @@ class BTCompanionService : CompanionDeviceService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var routingJob: Job? = null
     private var disappearanceJob: Job? = null
+    private var stateJob: Job? = null
 
     private var activeAssociationId: Int? = null
     private var activeAddress: String? = null
@@ -37,9 +44,10 @@ class BTCompanionService : CompanionDeviceService() {
 
     override fun onCreate() {
         super.onCreate()
-        audioRoutingManager = AudioRoutingManager(applicationContext)
-        companionManager = DeviceCompanionManager(applicationContext)
-        preferences = Preferences(applicationContext)
+        val app = application as BTMicFixApp
+        audioRoutingManager = app.audioRoutingManager
+        companionManager = app.companionManager
+        preferences = app.preferences
         companionManager.reconcilePriority()
     }
 
@@ -50,62 +58,89 @@ class BTCompanionService : CompanionDeviceService() {
             Logger.i("Ignoring non-priority association ${associationInfo.id}")
             return
         }
-        if (!preferences.autoRouteEnabled) {
-            Logger.i("Priority device appeared, but automatic routing is disabled")
-            return
-        }
 
         disappearanceJob?.cancel()
         disappearanceJob = null
+
         val priority = companionManager.getPriorityDevice() ?: return
         activeAssociationId = associationInfo.id
         activeAddress = priority.address
         activeRoutingName = priority.routingName
 
-        startForegroundWithNotification("Connessione…")
-        audioRoutingManager.startMonitoring()
+        if (!preferences.autoRouteEnabled || audioRoutingManager.isAutoRouteSuppressedUntilDisconnect()) {
+            Logger.i("Priority device appeared, but automatic routing is disabled/suppressed")
+            return
+        }
+
+        startForegroundWithNotification("Preferenza Bluetooth in preparazione…")
+        stateJob?.cancel()
+        stateJob = serviceScope.launch {
+            audioRoutingManager.routingState.collect { state ->
+                val text = when (state) {
+                    is AudioRoutingManager.RoutingState.Active ->
+                        "Preferenza attiva: ${state.deviceName}"
+                    is AudioRoutingManager.RoutingState.Yielded ->
+                        "Controllo audio ceduto temporaneamente"
+                    is AudioRoutingManager.RoutingState.Requested ->
+                        "Preferenza Bluetooth registrata"
+                    is AudioRoutingManager.RoutingState.Failed ->
+                        "Routing non riuscito: ${state.reason}"
+                    AudioRoutingManager.RoutingState.Idle ->
+                        "Preferenza disattivata"
+                }
+                updateNotification(text)
+            }
+        }
         routingJob?.cancel()
         routingJob = serviceScope.launch {
+            // Retry only while the Bluetooth communication endpoint has not appeared yet.
+            // Once Android accepts our request (ACTIVE or YIELDED), stop. No route-hold loop.
+            val deadline = android.os.SystemClock.elapsedRealtime() + 15_000L
             var lastFailure = "dispositivo non ancora disponibile"
-            val availabilityDeadline = android.os.SystemClock.elapsedRealtime() + 30_000L
-            var attempt = 0
-            while (android.os.SystemClock.elapsedRealtime() < availabilityDeadline) {
-                attempt++
-                val result = audioRoutingManager.routeToPreferredBluetoothAndWait(
-                    activeAddress,
-                    activeRoutingName,
-                    timeoutMs = 30_000L,
+            while (android.os.SystemClock.elapsedRealtime() < deadline) {
+                val result = audioRoutingManager.requestPreferredRoute(
+                    address = activeAddress,
+                    name = activeRoutingName,
+                    displayName = priority.name,
+                    trigger = RoutingPolicy.Trigger.AUTO_DEVICE_APPEARED,
+                    autoRouteEnabled = true,
+                    timeoutMs = 2_500L,
                 )
-                if (result is AudioRoutingManager.RoutingState.Active) {
-                    updateNotification("Microfono instradato su ${result.deviceName}")
-                    Logger.i("Background routing active at attempt $attempt")
-                    return@launch
+
+                when (result) {
+                    is AudioRoutingManager.RoutingState.Active -> {
+                        updateNotification("Preferenza attiva: ${result.deviceName}")
+                        return@launch
+                    }
+                    is AudioRoutingManager.RoutingState.Yielded -> {
+                        updateNotification("Preferenza pronta — controllo temporaneamente ceduto")
+                        return@launch
+                    }
+                    is AudioRoutingManager.RoutingState.Requested -> {
+                        updateNotification("Preferenza Bluetooth registrata")
+                        return@launch
+                    }
+                    is AudioRoutingManager.RoutingState.Failed -> {
+                        lastFailure = result.reason
+                        if (!result.reason.contains("non connesso", ignoreCase = true)) break
+                    }
+                    AudioRoutingManager.RoutingState.Idle -> Unit
                 }
-                if (result is AudioRoutingManager.RoutingState.Failed) {
-                    lastFailure = result.reason
-                    // Retry only while Android has not exposed the BT communication endpoint.
-                    // A real routing timeout/rejection is definitive for this appearance event.
-                    if (!result.reason.contains("non connesso", ignoreCase = true)) break
-                }
-                delay(500)
+                delay(500L)
             }
-            updateNotification("Instradamento non riuscito — apri BTMicFix")
-            Logger.w("Background routing failed: $lastFailure")
+            Logger.w("Auto-route request not placed: $lastFailure")
+            updateNotification("Dispositivo presente — apri BTMicFix per attivare")
         }
     }
 
     override fun onDeviceDisappeared(associationInfo: AssociationInfo) {
         super.onDeviceDisappeared(associationInfo)
         val wasActive = activeAssociationId == associationInfo.id
-        if (!wasActive && !companionManager.isPriorityAssociation(associationInfo)) {
-            return
-        }
+        if (!wasActive && !companionManager.isPriorityAssociation(associationInfo)) return
 
         disappearanceJob?.cancel()
         disappearanceJob = serviceScope.launch {
-            // Companion presence can flap briefly while Bluetooth profiles/SCO are changing.
-            // Give Android a short grace window and verify the REAL audio state before treating
-            // this as a physical disappearance. Never clear a still-valid route from this callback.
+            // Companion presence may flap while SCO/profile roles change. Never clear routing here.
             delay(2_000L)
             val checkAddress = if (wasActive) activeAddress else associationInfo.deviceMacAddress?.toString()
             val checkName = if (wasActive) activeRoutingName else companionManager.getPriorityDevice()?.routingName
@@ -116,9 +151,12 @@ class BTCompanionService : CompanionDeviceService() {
                 return@launch
             }
 
+            // Android automatically cancels setCommunicationDevice() when the device disconnects.
+            audioRoutingManager.notePreferredDeviceDisconnected(checkAddress)
             routingJob?.cancel()
             routingJob = null
-            audioRoutingManager.stopMonitoring()
+            stateJob?.cancel()
+            stateJob = null
             activeAssociationId = null
             activeAddress = null
             activeRoutingName = null
@@ -132,8 +170,9 @@ class BTCompanionService : CompanionDeviceService() {
         routingJob = null
         disappearanceJob?.cancel()
         disappearanceJob = null
+        stateJob?.cancel()
+        stateJob = null
         serviceScope.cancel()
-        audioRoutingManager.stopMonitoring()
         activeAssociationId = null
         activeAddress = null
         activeRoutingName = null

@@ -1,6 +1,8 @@
 package com.btmicfix.audio
 
 import android.Manifest
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioDeviceCallback
@@ -66,12 +68,25 @@ class AudioRoutingManager(private val context: Context) {
     private var lastObservedPriorityInput: AudioDeviceInfo? = null
     private var monitoring = false
 
+    private val requestLock = Any()
+    @Volatile private var requestOutstanding = false
+    @Volatile private var autoRouteSuppressedUntilDisconnect = false
+    private var requestedAddress: String? = null
+    private var requestedName: String? = null
+    private var requestedDisplayName: String? = null
+
     private val communicationDeviceChangedListener =
         AudioManager.OnCommunicationDeviceChangedListener { device ->
             Logger.i("Communication device changed: ${device?.let(::deviceLabel) ?: "none"}")
             refreshAvailableDevices()
             syncRoutingStateWithSystem()
         }
+
+    private val modeChangedListener = AudioManager.OnModeChangedListener { mode ->
+        Logger.i("Audio mode changed: ${audioModeLabel(mode)}")
+        // Observation only. Never re-assert a route because another app changed audio mode.
+        syncRoutingStateWithSystem()
+    }
 
     private val deviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
@@ -90,8 +105,15 @@ class AudioRoutingManager(private val context: Context) {
 
     sealed class RoutingState {
         data object Idle : RoutingState()
-        data class Routing(val deviceName: String) : RoutingState()
+        /** Android accepted our one-shot request but has not selected it yet. */
+        data class Requested(val deviceName: String) : RoutingState()
         data class Active(val deviceName: String) : RoutingState()
+        /** Another audio owner (phone/VoIP/assistant) temporarily has the communication route. */
+        data class Yielded(
+            val deviceName: String,
+            val currentDevice: String,
+            val audioMode: String,
+        ) : RoutingState()
         data class Failed(val reason: String) : RoutingState()
     }
 
@@ -194,6 +216,7 @@ class AudioRoutingManager(private val context: Context) {
             context.mainExecutor,
             communicationDeviceChangedListener,
         )
+        audioManager.addOnModeChangedListener(context.mainExecutor, modeChangedListener)
         refreshAvailableDevices()
         syncRoutingStateWithSystem()
     }
@@ -205,6 +228,7 @@ class AudioRoutingManager(private val context: Context) {
         try {
             audioManager.removeOnCommunicationDeviceChangedListener(communicationDeviceChangedListener)
         } catch (_: Exception) {}
+        try { audioManager.removeOnModeChangedListener(modeChangedListener) } catch (_: Exception) {}
     }
 
     private fun bluetoothCommunicationDevices(): List<AudioDeviceInfo> =
@@ -282,151 +306,153 @@ class AudioRoutingManager(private val context: Context) {
             a.productName?.toString()?.trim()?.equals(bName, ignoreCase = true) == true
     }
 
-    private fun routeToPreferredBluetooth(address: String?, name: String?): RoutingState {
+    /**
+     * Place at most one communication-device selection request.
+     *
+     * IMPORTANT: BTMicFix deliberately NEVER calls AudioManager.setMode(). Android documents
+     * that simultaneous setCommunicationDevice() requests are prioritized in favor of the app
+     * controlling the audio mode. That means phone/VoIP/assistant sessions must be free to take
+     * temporary priority. We observe that as Yielded and never fight it with a timer/retry loop.
+     */
+    suspend fun requestPreferredRoute(
+        address: String?,
+        name: String?,
+        displayName: String? = null,
+        trigger: RoutingPolicy.Trigger = RoutingPolicy.Trigger.USER_ENABLE,
+        autoRouteEnabled: Boolean = false,
+        timeoutMs: Long = 2_500L,
+        pollMs: Long = 75L,
+    ): RoutingState = routingMutex.withLock {
         if (address.isNullOrBlank() && name.isNullOrBlank()) {
-            return RoutingState.Failed("Nessun dispositivo prioritario selezionato").also {
+            return@withLock RoutingState.Failed("Nessun dispositivo prioritario selezionato").also {
                 _routingState.value = it
             }
         }
 
-        val current = audioManager.communicationDevice
-        if (deviceMatchesPreference(current, address, name)) {
-            currentRoutedDevice = current
-            return RoutingState.Active(
-                current?.productName?.toString()?.takeIf { it.isNotBlank() }
-                    ?: name?.takeIf { it.isNotBlank() }
-                    ?: "Dispositivo Bluetooth"
-            ).also { _routingState.value = it }
+        if (trigger == RoutingPolicy.Trigger.USER_ENABLE) {
+            autoRouteSuppressedUntilDisconnect = false
         }
 
         val target = findPreferredBluetoothCommunicationDevice(address, name)
-            ?: return RoutingState.Failed("Dispositivo prioritario non connesso").also {
+        val alreadyOutstanding = isRouteRequestOutstandingFor(address, name)
+        val shouldIssue = RoutingPolicy.shouldIssueRequest(
+            trigger = trigger,
+            autoRouteEnabled = autoRouteEnabled,
+            targetAvailable = target != null,
+            requestAlreadyOutstanding = alreadyOutstanding,
+        )
+
+        if (!shouldIssue) {
+            syncRoutingStateWithSystem()
+            return@withLock _routingState.value
+        }
+
+        if (target == null) {
+            return@withLock RoutingState.Failed("Dispositivo prioritario non connesso").also {
                 _routingState.value = it
             }
+        }
 
-        return routeToBluetooth(target)
-    }
+        val label = displayName?.takeIf { it.isNotBlank() }
+            ?: target.productName?.toString()?.takeIf { it.isNotBlank() }
+            ?: name?.takeIf { it.isNotBlank() }
+            ?: "Dispositivo Bluetooth"
 
-    /**
-     * Wait until communicationDevice confirms the request; boolean acceptance is not enough.
-     * Routing requests are serialized process-wide because Activity and CompanionDeviceService
-     * use separate AudioRoutingManager instances but control the same AudioManager state.
-     */
-    suspend fun routeToPreferredBluetoothAndWait(
-        address: String?,
-        name: String?,
-        timeoutMs: Long = 30_000L,
-        pollMs: Long = 75L,
-    ): RoutingState = routingMutex.withLock {
-        val requested = routeToPreferredBluetooth(address, name)
-        if (requested is RoutingState.Failed) return@withLock requested
+        val accepted = try {
+            audioManager.setCommunicationDevice(target)
+        } catch (e: Exception) {
+            Logger.e("setCommunicationDevice failed", e)
+            false
+        }
+
+        if (!accepted) {
+            return@withLock RoutingState.Failed("setCommunicationDevice ha restituito false").also {
+                _routingState.value = it
+            }
+        }
+
+        synchronized(requestLock) {
+            requestOutstanding = true
+            requestedAddress = address
+            requestedName = name
+            requestedDisplayName = label
+        }
+        _routingState.value = RoutingState.Requested(label)
 
         val deadline = SystemClock.elapsedRealtime() + timeoutMs.coerceAtLeast(250L)
-        try {
-            do {
-                val actual = audioManager.communicationDevice
-                if (deviceMatchesPreference(actual, address, name)) {
-                    currentRoutedDevice = actual
-                    return@withLock RoutingState.Active(
-                        actual?.productName?.toString()?.takeIf { it.isNotBlank() }
-                            ?: name?.takeIf { it.isNotBlank() }
-                            ?: "Dispositivo Bluetooth"
-                    ).also { _routingState.value = it }
-                }
-                delay(pollMs.coerceAtLeast(25L))
-            } while (SystemClock.elapsedRealtime() < deadline)
-
-            clearRouting()
-            RoutingState.Failed("Timeout: Android non ha attivato il dispositivo prioritario").also {
-                _routingState.value = it
+        do {
+            val actual = audioManager.communicationDevice
+            if (deviceMatchesPreference(actual, address, name)) {
+                currentRoutedDevice = actual
+                return@withLock RoutingState.Active(label).also { _routingState.value = it }
             }
-        } catch (cancelled: CancellationException) {
-            // Cancel the pending communication-device request made by this app. Do not leave
-            // MODE_IN_COMMUNICATION or a delayed device switch behind after disconnect/cancel.
-            clearRouting()
-            throw cancelled
-        }
+            delay(pollMs.coerceAtLeast(25L))
+        } while (SystemClock.elapsedRealtime() < deadline)
+
+        // The request was accepted but another app may currently own the audio mode. Keep our
+        // request alive and yield. Android can return the route later without any re-assertion.
+        syncRoutingStateWithSystem()
+        return@withLock _routingState.value
     }
 
-    private fun routeToBluetooth(device: AudioDeviceInfo): RoutingState {
-        val deviceName = device.productName?.toString()?.takeIf { it.isNotBlank() }
-            ?: "Dispositivo Bluetooth"
-        _routingState.value = RoutingState.Routing(deviceName)
-
-        return try {
-            synchronized(audioModeLock) {
-                if (savedAudioModeBeforeRouting == null) {
-                    savedAudioModeBeforeRouting = audioManager.mode
-                }
-            }
-            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-            val accepted = audioManager.setCommunicationDevice(device)
-            if (!accepted) {
-                restoreOwnAudioMode()
-                RoutingState.Failed("setCommunicationDevice ha restituito false").also {
-                    _routingState.value = it
-                }
-            } else {
-                val actual = audioManager.communicationDevice
-                if (sameAudioEndpoint(actual, device)) {
-                    currentRoutedDevice = actual
-                    RoutingState.Active(deviceName).also { _routingState.value = it }
-                } else {
-                    RoutingState.Routing(deviceName).also { _routingState.value = it }
-                }
-            }
-        } catch (e: Exception) {
-            restoreOwnAudioMode()
-            RoutingState.Failed(e.message ?: "Errore routing").also {
-                _routingState.value = it
-            }
-        }
-    }
-
-    private fun clearRouting() {
-        try { audioManager.clearCommunicationDevice() } catch (e: Exception) {
-            Logger.e("Error clearing communication device", e)
-        } finally {
-            restoreOwnAudioMode()
-            currentRoutedDevice = null
-            _routingState.value = RoutingState.Idle
-        }
-    }
-
-    /** Clear only if the real system route is still the selected priority device. */
-    fun clearRoutingIfPreferred(address: String?, name: String?): Boolean {
-        if (!deviceMatchesPreference(audioManager.communicationDevice, address, name)) {
-            // Another route already owns communication. Never force the global audio mode back
-            // to a stale value in this branch: that could disturb Android Auto / another call.
-            abandonOwnAudioModeOwnership()
-            syncRoutingStateWithSystem()
-            return false
-        }
-        clearRouting()
-        return true
-    }
-
-    private fun restoreOwnAudioMode() {
-        val oldMode = synchronized(audioModeLock) {
-            val value = savedAudioModeBeforeRouting
-            savedAudioModeBeforeRouting = null
+    /** Explicit user/configuration action only. Never called because another app took the route. */
+    fun deactivatePreferredRoute(suppressAutoRouteUntilDisconnect: Boolean = true) {
+        autoRouteSuppressedUntilDisconnect = suppressAutoRouteUntilDisconnect
+        val hadRequest = synchronized(requestLock) {
+            val value = requestOutstanding
+            requestOutstanding = false
+            requestedAddress = null
+            requestedName = null
+            requestedDisplayName = null
             value
-        } ?: return
-
-        try {
-            if (audioManager.mode == AudioManager.MODE_IN_COMMUNICATION) {
-                audioManager.mode = oldMode
+        }
+        if (hadRequest) {
+            try {
+                audioManager.clearCommunicationDevice()
+            } catch (e: Exception) {
+                Logger.e("Error clearing BTMicFix communication-device request", e)
             }
-        } catch (e: Exception) {
-            Logger.w("Could not restore previous audio mode: ${e.javaClass.simpleName}")
         }
+        currentRoutedDevice = null
+        _routingState.value = RoutingState.Idle
     }
 
-    private fun abandonOwnAudioModeOwnership() {
-        synchronized(audioModeLock) {
-            savedAudioModeBeforeRouting = null
+    /** Platform automatically cancels the selection on physical target disconnect. */
+    fun notePreferredDeviceDisconnected(address: String?) {
+        // A real disconnect ends a manual suppression window; the next physical appearance may
+        // auto-route again if the user left automatic routing enabled.
+        autoRouteSuppressedUntilDisconnect = false
+        val matchesOutstanding = synchronized(requestLock) {
+            requestOutstanding &&
+                !address.isNullOrBlank() &&
+                !requestedAddress.isNullOrBlank() &&
+                requestedAddress.equals(address, ignoreCase = true)
         }
+        if (!matchesOutstanding) return
+
+        synchronized(requestLock) {
+            requestOutstanding = false
+            requestedAddress = null
+            requestedName = null
+            requestedDisplayName = null
+        }
+        currentRoutedDevice = null
+        _routingState.value = RoutingState.Idle
     }
+
+    fun isRouteRequestOutstanding(): Boolean = synchronized(requestLock) { requestOutstanding }
+
+    fun isAutoRouteSuppressedUntilDisconnect(): Boolean = autoRouteSuppressedUntilDisconnect
+
+    fun isRouteRequestOutstandingFor(address: String?, name: String?): Boolean =
+        synchronized(requestLock) {
+            if (!requestOutstanding) return@synchronized false
+            val addressMatch = !address.isNullOrBlank() && !requestedAddress.isNullOrBlank() &&
+                requestedAddress.equals(address, ignoreCase = true)
+            val nameMatch = !name.isNullOrBlank() && !requestedName.isNullOrBlank() &&
+                requestedName.equals(name, ignoreCase = true)
+            addressMatch || nameMatch
+        }
 
     fun isPreferredBluetoothAvailable(address: String?, name: String?): Boolean {
         if (address.isNullOrBlank() && name.isNullOrBlank()) return false
@@ -447,6 +473,41 @@ class AudioRoutingManager(private val context: Context) {
         if (!isBluetoothMicDevice(device)) return null
         return device.productName?.toString()?.takeIf { it.isNotBlank() }
     }
+
+    @SuppressLint("MissingPermission")
+    fun resolveStableBluetoothAddress(device: BluetoothAudioDevice): String? {
+        device.deviceInfo.address.trim().takeIf { it.isNotBlank() }?.let { return it }
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) !=
+            PackageManager.PERMISSION_GRANTED
+        ) return null
+
+        val adapter = context.getSystemService<BluetoothManager>()?.adapter ?: return null
+        val targetName = device.name.trim()
+        val matches = try {
+            adapter.bondedDevices.filter { bonded ->
+                val alias = try { bonded.alias } catch (_: Throwable) { null }
+                val name = try { bonded.name } catch (_: Throwable) { null }
+                listOfNotNull(alias, name).any { it.trim().equals(targetName, ignoreCase = true) }
+            }
+        } catch (_: Throwable) {
+            emptyList()
+        }
+        return matches.singleOrNull()?.address
+    }
+
+    fun matchesPreferredDevice(
+        device: BluetoothAudioDevice,
+        preferredAddress: String?,
+        preferredName: String?,
+    ): Boolean = deviceMatchesPreference(device.deviceInfo, preferredAddress, preferredName)
+
+    fun isCurrentCommunicationDevice(device: BluetoothAudioDevice): Boolean =
+        sameAudioEndpoint(audioManager.communicationDevice, device.deviceInfo)
+
+    fun currentCommunicationDeviceName(): String? =
+        audioManager.communicationDevice?.productName?.toString()?.takeIf { it.isNotBlank() }
+
+    fun currentAudioModeLabel(): String = audioModeLabel(audioManager.mode)
 
     suspend fun testBluetoothMicrophone(
         source: MicTestSource,
@@ -945,29 +1006,60 @@ class AudioRoutingManager(private val context: Context) {
     }
 
     private fun syncRoutingStateWithSystem() {
-        val systemDevice = audioManager.communicationDevice
-        val preferredAddress = preferences.pairedDeviceAddress
-        val preferredName = preferences.pairedDeviceName
-        val targetActive = preferences.hasPreferredDevice() &&
-            deviceMatchesPreference(systemDevice, preferredAddress, preferredName)
+        val request = synchronized(requestLock) {
+            Triple(requestOutstanding, requestedAddress, requestedName)
+        }
+        val outstanding = request.first
+        val address = request.second
+        val name = request.third
+        val label = synchronized(requestLock) {
+            requestedDisplayName?.takeIf { it.isNotBlank() }
+        } ?: name?.takeIf { !it.isNullOrBlank() }
+            ?: preferences.pairedDeviceName?.takeIf { !it.isNullOrBlank() }
+            ?: "Dispositivo Bluetooth"
 
-        if (targetActive) {
-            currentRoutedDevice = systemDevice
-            _routingState.value = RoutingState.Active(
-                systemDevice?.productName?.toString()?.takeIf { it.isNotBlank() }
-                    ?: preferredName?.takeIf { it.isNotBlank() }
-                    ?: "Dispositivo Bluetooth"
-            )
+        if (!outstanding) {
+            currentRoutedDevice = null
+            _routingState.value = RoutingState.Idle
             return
         }
 
-        currentRoutedDevice = null
-        val previous = _routingState.value
-        if (previous is RoutingState.Active || previous is RoutingState.Routing) {
-            // The target is no longer the system route. Ownership is now ambiguous, so do not
-            // write AudioManager.mode here; simply forget our saved mode and mirror reality.
-            abandonOwnAudioModeOwnership()
-            _routingState.value = RoutingState.Idle
+        val targetAvailable = findPreferredBluetoothCommunicationDevice(address, name) != null ||
+            deviceMatchesPreference(audioManager.communicationDevice, address, name)
+
+        // Do not infer a physical disconnect from a transient AudioDeviceInfo/profile flap.
+        // CompanionDeviceService performs the debounced physical-disappearance decision and
+        // calls notePreferredDeviceDisconnected(). Until then our accepted request stays logical.
+        val systemDevice = audioManager.communicationDevice
+        val targetIsCurrent = deviceMatchesPreference(systemDevice, address, name)
+        val logical = RoutingPolicy.evaluate(
+            RoutingPolicy.Snapshot(
+                requestEnabled = true,
+                targetAvailable = targetAvailable,
+                targetIsCurrentCommunicationDevice = targetIsCurrent,
+                currentDeviceLabel = systemDevice?.let(::deviceLabel),
+                audioMode = audioManager.mode,
+            )
+        )
+
+        when (logical) {
+            RoutingPolicy.LogicalState.ACTIVE -> {
+                currentRoutedDevice = systemDevice
+                _routingState.value = RoutingState.Active(label)
+            }
+            RoutingPolicy.LogicalState.YIELDED_TO_OTHER_AUDIO_OWNER -> {
+                currentRoutedDevice = null
+                _routingState.value = RoutingState.Yielded(
+                    deviceName = label,
+                    currentDevice = systemDevice?.let(::deviceLabel) ?: "route di sistema",
+                    audioMode = audioModeLabel(audioManager.mode),
+                )
+            }
+            RoutingPolicy.LogicalState.DISABLED,
+            RoutingPolicy.LogicalState.WAITING_FOR_DEVICE -> {
+                currentRoutedDevice = null
+                _routingState.value = RoutingState.Idle
+            }
         }
     }
 
@@ -1000,6 +1092,17 @@ class AudioRoutingManager(private val context: Context) {
         else -> "Tipo $type"
     }
 
+    private fun audioModeLabel(mode: Int): String = when (mode) {
+        AudioManager.MODE_NORMAL -> "NORMAL"
+        AudioManager.MODE_RINGTONE -> "RINGTONE"
+        AudioManager.MODE_IN_CALL -> "IN_CALL"
+        AudioManager.MODE_IN_COMMUNICATION -> "IN_COMMUNICATION"
+        AudioManager.MODE_CALL_SCREENING -> "CALL_SCREENING"
+        AudioManager.MODE_CALL_REDIRECT -> "CALL_REDIRECT"
+        AudioManager.MODE_COMMUNICATION_REDIRECT -> "COMMUNICATION_REDIRECT"
+        else -> "MODE_$mode"
+    }
+
     private fun looksLikeMac(value: String): Boolean =
         Regex("(?i)^[0-9A-F]{2}(:[0-9A-F]{2}){5}$").matches(value.trim())
 
@@ -1012,8 +1115,6 @@ class AudioRoutingManager(private val context: Context) {
         else max(DBFS_FLOOR, 20.0 * log10(peak.toDouble() / PCM_FULL_SCALE))
 
     companion object {
-        private val audioModeLock = Any()
-        @Volatile private var savedAudioModeBeforeRouting: Int? = null
         private val routingMutex = Mutex()
 
         private const val MIC_BASELINE_MS = 2_500L

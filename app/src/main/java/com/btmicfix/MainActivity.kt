@@ -1,7 +1,5 @@
 package com.btmicfix
 
-import android.bluetooth.BluetoothDevice
-import android.content.Context
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -9,53 +7,39 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.lifecycle.lifecycleScope
 import com.btmicfix.audio.AudioRoutingManager
-import com.btmicfix.audio.BluetoothStateReceiver
+import com.btmicfix.audio.RoutingPolicy
 import com.btmicfix.companion.DeviceCompanionManager
 import com.btmicfix.shizuku.ShizukuManager
 import com.btmicfix.ui.screens.DetailsScreen
 import com.btmicfix.ui.screens.HomeScreen
 import com.btmicfix.ui.screens.SetupScreen
 import com.btmicfix.ui.theme.BTMicFixTheme
-import com.btmicfix.util.Logger
 import com.btmicfix.util.Preferences
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 
-class MainActivity : ComponentActivity(), BluetoothStateReceiver.BluetoothConnectionListener {
+class MainActivity : ComponentActivity() {
 
     private lateinit var audioRoutingManager: AudioRoutingManager
     private lateinit var shizukuManager: ShizukuManager
     private lateinit var companionManager: DeviceCompanionManager
     private lateinit var preferences: Preferences
-    private val btReceiver = BluetoothStateReceiver()
-    private val activityScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private var foregroundRoutingJob: Job? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        audioRoutingManager = AudioRoutingManager(this)
+        val app = application as BTMicFixApp
+        audioRoutingManager = app.audioRoutingManager
+        companionManager = app.companionManager
+        preferences = app.preferences
         shizukuManager = ShizukuManager()
-        companionManager = DeviceCompanionManager(this)
-        preferences = Preferences(this)
 
         companionManager.reconcilePriority()
-        audioRoutingManager.startMonitoring()
         shizukuManager.initialize()
         companionManager.resumeObservingPriorityAssociation()
-
-        BluetoothStateReceiver.listener = this
-        registerReceiver(
-            btReceiver,
-            BluetoothStateReceiver.getIntentFilter(),
-            Context.RECEIVER_EXPORTED,
-        )
 
         setContent {
             BTMicFixTheme {
@@ -97,41 +81,24 @@ class MainActivity : ComponentActivity(), BluetoothStateReceiver.BluetoothConnec
         super.onResume()
         companionManager.reconcilePriority()
         shizukuManager.refreshStatus()
-    }
 
-    override fun onDestroy() {
-        BluetoothStateReceiver.listener = null
-        try { unregisterReceiver(btReceiver) } catch (_: Exception) {}
-        audioRoutingManager.stopMonitoring()
-        foregroundRoutingJob?.cancel()
-        foregroundRoutingJob = null
-        shizukuManager.cleanup()
-        activityScope.cancel()
-        super.onDestroy()
-    }
-
-    override fun onBluetoothDeviceConnected(device: BluetoothDevice) {
-        if (!preferences.autoRouteEnabled || !preferences.isPreferredDevice(device.address)) return
-        foregroundRoutingJob?.cancel()
-        foregroundRoutingJob = activityScope.launch {
-            val priority = companionManager.getPriorityDevice() ?: return@launch
-            audioRoutingManager.routeToPreferredBluetoothAndWait(
-                priority.address,
-                priority.routingName,
+        // One-shot auto request only. Never react to later audio-mode/device changes here.
+        val priority = companionManager.getPriorityDevice() ?: return
+        if (!preferences.autoRouteEnabled || audioRoutingManager.isAutoRouteSuppressedUntilDisconnect()) return
+        lifecycleScope.launch(Dispatchers.IO) {
+            audioRoutingManager.requestPreferredRoute(
+                address = priority.address,
+                name = priority.routingName,
+                displayName = priority.name,
+                trigger = RoutingPolicy.Trigger.APP_RESUME,
+                autoRouteEnabled = true,
             )
         }
     }
 
-    override fun onBluetoothDeviceDisconnected(device: BluetoothDevice) {
-        if (!preferences.isPreferredDevice(device.address)) return
-        // Cancel a foreground request that may still be waiting for Android to switch.
-        // routeToPreferredBluetoothAndWait() performs its own cancellation cleanup.
-        foregroundRoutingJob?.cancel()
-        foregroundRoutingJob = null
-        // Do not call clearCommunicationDevice() from an ACL-disconnect broadcast. Android
-        // automatically removes a communication-device selection when the device truly
-        // disconnects; explicitly clearing here can tear down a still-valid SCO route on
-        // transient/OEM Bluetooth profile events.
+    override fun onDestroy() {
+        shizukuManager.cleanup()
+        super.onDestroy()
     }
 
     private enum class Screen { Home, Setup, Details }

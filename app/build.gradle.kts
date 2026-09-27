@@ -14,8 +14,8 @@ android {
         applicationId = "com.btmicfix"
         minSdk = 33
         targetSdk = 34
-        versionCode = 17
-        versionName = "0.6.6-route-hold-micfix"
+        versionCode = 19
+        versionName = "0.8.0-inverse-exclusion-probe"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

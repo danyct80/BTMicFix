@@ -4,12 +4,23 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.util.Log
+import com.btmicfix.audio.AudioRoutingManager
+import com.btmicfix.companion.DeviceCompanionManager
+import com.btmicfix.util.Preferences
 
 /**
- * Application class for BTMicFix.
- * Handles one-time initialization: notification channel creation.
+ * Process-wide owner of routing state.
+ * Activity and CompanionDeviceService deliberately share the SAME AudioRoutingManager so they
+ * cannot issue conflicting requests or keep divergent local state.
  */
 class BTMicFixApp : Application() {
+
+    lateinit var audioRoutingManager: AudioRoutingManager
+        private set
+    lateinit var companionManager: DeviceCompanionManager
+        private set
+    lateinit var preferences: Preferences
+        private set
 
     companion object {
         const val TAG = "BTMicFix"
@@ -20,20 +31,27 @@ class BTMicFixApp : Application() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        Log.i(TAG, "BTMicFix initialized")
+
+        preferences = Preferences(this)
+        companionManager = DeviceCompanionManager(this)
+        audioRoutingManager = AudioRoutingManager(this)
+
+        companionManager.reconcilePriority()
+        audioRoutingManager.startMonitoring()
+
+        Log.i(TAG, "BTMicFix process coordinator initialized")
     }
 
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
             NOTIFICATION_CHANNEL_ID,
             getString(R.string.notification_channel_name),
-            NotificationManager.IMPORTANCE_LOW
+            NotificationManager.IMPORTANCE_LOW,
         ).apply {
             description = getString(R.string.notification_channel_desc)
             setShowBadge(false)
         }
 
-        val notificationManager = getSystemService(NotificationManager::class.java)
-        notificationManager.createNotificationChannel(channel)
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 }

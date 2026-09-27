@@ -41,6 +41,9 @@ class ShizukuManager {
     private val _lastForceResult = MutableStateFlow<String?>(null)
     val lastForceResult: StateFlow<String?> = _lastForceResult.asStateFlow()
 
+    private val _lastExclusionResult = MutableStateFlow<String?>(null)
+    val lastExclusionResult: StateFlow<String?> = _lastExclusionResult.asStateFlow()
+
     private var privilegedService: IPrivilegedService? = null
     private var bindingRequested = false
     @Volatile private var forcedScoApplied = false
@@ -218,6 +221,42 @@ class ShizukuManager {
     }
 
     fun isForcedBluetoothScoApplied(): Boolean = forcedScoApplied
+
+    fun inspectVoiceExclusionCapabilities(): String {
+        val service = privilegedService
+        if (service == null || !service.asBinder().pingBinder()) {
+            bindPrivilegedService()
+            return "RESULT=UNAVAILABLE\nServizio privilegiato non ancora connesso"
+        }
+        return try {
+            service.inspectVoiceExclusionCapabilities() ?: "RESULT=UNAVAILABLE\nNessuna risposta"
+        } catch (e: Exception) {
+            "RESULT=UNAVAILABLE\n${e.javaClass.simpleName}: ${e.message}"
+        }
+    }
+
+    fun testVoiceDeviceExclusion(
+        publicType: Int,
+        address: String,
+        name: String,
+        durationMs: Int = 20_000,
+    ): String {
+        val service = privilegedService
+        if (service == null || !service.asBinder().pingBinder()) {
+            bindPrivilegedService()
+            return "RESULT=UNAVAILABLE\nServizio privilegiato non ancora connesso"
+        }
+        return try {
+            val result = service.testVoiceDeviceExclusion(publicType, address, name, durationMs)
+                ?: "RESULT=UNAVAILABLE\nNessuna risposta"
+            _lastExclusionResult.value = result
+            result
+        } catch (e: Exception) {
+            val result = "RESULT=UNAVAILABLE\n${e.javaClass.simpleName}: ${e.message}"
+            _lastExclusionResult.value = result
+            result
+        }
+    }
 
     fun getRoutingCapabilities(): String {
         val service = privilegedService

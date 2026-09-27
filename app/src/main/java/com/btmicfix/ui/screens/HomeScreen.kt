@@ -27,18 +27,20 @@ import com.btmicfix.audio.AudioRoutingManager.MicTestScenario
 import com.btmicfix.audio.AudioRoutingManager.MicTestSource
 import com.btmicfix.audio.AudioRoutingManager.MicTestVerdict
 import com.btmicfix.audio.AudioRoutingManager.RoutingState
+import com.btmicfix.audio.RoutingPolicy
+import com.btmicfix.audio.VoiceExclusionPolicy
 import com.btmicfix.companion.DeviceCompanionManager
 import com.btmicfix.shizuku.ShizukuManager
 import com.btmicfix.ui.components.DeviceSelector
 import com.btmicfix.ui.components.ShizukuStatusCard
 import com.btmicfix.ui.components.StatusCard
+import com.btmicfix.ui.components.VoiceExclusionProbeCard
 import com.btmicfix.ui.theme.*
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -67,54 +69,38 @@ fun HomeScreen(
         priorityAddress,
         priorityRoutingName,
     )
+    val requestOutstanding = audioRoutingManager.isRouteRequestOutstanding()
 
     var diagnosticRunning by remember { mutableStateOf(false) }
     var diagnosticStep by remember { mutableStateOf<String?>(null) }
     var diagnosticReport by remember(priorityAddress, priorityRoutingName) { mutableStateOf<String?>(null) }
     var diagnosticOk by remember(priorityAddress, priorityRoutingName) { mutableStateOf<Boolean?>(null) }
     var pendingDiagnostic by remember { mutableStateOf(false) }
-    var routeHoldRequested by remember { mutableStateOf(false) }
-    var routeHoldJob by remember { mutableStateOf<Job?>(null) }
 
-    fun startRouteHold() {
-        if (priority == null) return
-        routeHoldRequested = true
-        routeHoldJob?.cancel()
-        routeHoldJob = scope.launch {
-            while (isActive && routeHoldRequested) {
-                if (audioRoutingManager.isPreferredBluetoothAvailable(
-                        priorityAddress,
-                        priorityRoutingName,
-                    )
-                ) {
-                    withContext(Dispatchers.IO) {
-                        audioRoutingManager.routeToPreferredBluetoothAndWait(
-                            priorityAddress,
-                            priorityRoutingName,
-                            timeoutMs = 2_500L,
-                        )
-                    }
-                }
-                delay(750L)
-            }
+    val exclusionCandidates = availableDevices.filterNot { device ->
+        audioRoutingManager.matchesPreferredDevice(
+            device = device,
+            preferredAddress = priorityAddress,
+            preferredName = priorityRoutingName,
+        )
+    }
+    var selectedExclusionDeviceId by remember { mutableStateOf<Int?>(null) }
+    var exclusionRunning by remember { mutableStateOf(false) }
+    var exclusionSecondsRemaining by remember { mutableStateOf(0) }
+    var exclusionReport by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(exclusionCandidates.map { it.deviceInfo.id }) {
+        val currentStillExists = exclusionCandidates.any { it.deviceInfo.id == selectedExclusionDeviceId }
+        if (!currentStillExists) {
+            selectedExclusionDeviceId = exclusionCandidates.singleOrNull()?.deviceInfo?.id
         }
     }
 
-    fun stopRouteHold(clearRoute: Boolean) {
-        routeHoldRequested = false
-        routeHoldJob?.cancel()
-        routeHoldJob = null
-        if (clearRoute) {
-            audioRoutingManager.clearRoutingIfPreferred(priorityAddress, priorityRoutingName)
-        }
+    val selectedExclusionDevice = exclusionCandidates.firstOrNull {
+        it.deviceInfo.id == selectedExclusionDeviceId
     }
-
-    DisposableEffect(priorityAddress, priorityRoutingName) {
-        onDispose {
-            routeHoldRequested = false
-            routeHoldJob?.cancel()
-            routeHoldJob = null
-        }
+    val selectedExclusionAddress = selectedExclusionDevice?.let {
+        audioRoutingManager.resolveStableBluetoothAddress(it)
     }
 
     fun launchCompleteDiagnostic() {
@@ -128,15 +114,18 @@ fun HomeScreen(
         scope.launch {
             val lines = mutableListOf<String>()
             var failures = 0
-            val holdWasAlreadyRequested = routeHoldRequested
-            if (!holdWasAlreadyRequested) startRouteHold()
+            val requestWasAlreadyOutstanding = audioRoutingManager.isRouteRequestOutstanding()
+            val autoSuppressWasActive = audioRoutingManager.isAutoRouteSuppressedUntilDisconnect()
             try {
                 lines += "Target: $priorityDisplayName"
+                lines += "Policy normale: one-shot, nessun setMode, nessun route-hold"
 
                 if (priority == null) {
                     failures++
                     lines += "Target: FAIL — nessun dispositivo prioritario"
                 } else {
+                    // Diagnostics must start from a clean Shizuku policy so baseline captures
+                    // are not contaminated by a previous privileged force.
                     if (shizukuStatus == ShizukuManager.ShizukuStatus.READY) {
                         val privilegedReady = withContext(Dispatchers.IO) {
                             shizukuManager.awaitServiceReady()
@@ -145,7 +134,7 @@ fun HomeScreen(
                             failures++
                             lines += "Shizuku pre-clean: FAIL — servizio privilegiato non disponibile"
                             throw IllegalStateException(
-                                "Shizuku e autorizzato ma il servizio privilegiato non e pronto: baseline non garantita"
+                                "Shizuku autorizzato ma servizio privilegiato non pronto"
                             )
                         }
                         val preClear = withContext(Dispatchers.IO) {
@@ -153,29 +142,43 @@ fun HomeScreen(
                         }
                         if (!preClear.contains("RESULT=CLEARED", ignoreCase = true)) {
                             failures++
-                            lines += "Shizuku pre-clean: FAIL — impossibile garantire una baseline pulita"
+                            lines += "Shizuku pre-clean: FAIL — baseline non garantita"
                             throw IllegalStateException(
-                                "Policy Shizuku non ripristinabile: test audio annullati per evitare risultati contaminati"
+                                "Policy Shizuku non ripristinabile: test audio annullati"
                             )
                         }
                     }
 
-                    diagnosticStep = "1/9 Attivazione routing reale"
-                    val routed = withContext(Dispatchers.IO) {
-                        audioRoutingManager.routeToPreferredBluetoothAndWait(
-                            priorityAddress,
-                            priorityRoutingName,
-                        )
+                    diagnosticStep = "1/9 Richiesta one-shot della route"
+                    val routed = if (requestWasAlreadyOutstanding) {
+                        routingState
+                    } else {
+                        withContext(Dispatchers.IO) {
+                            audioRoutingManager.requestPreferredRoute(
+                                address = priorityAddress,
+                                name = priorityRoutingName,
+                                displayName = priorityDisplayName,
+                                trigger = RoutingPolicy.Trigger.USER_ENABLE,
+                            )
+                        }
                     }
+
+                    // Give SCO/input endpoints time to settle before the first AudioRecord.
+                    delay(1_500L)
                     val active = audioRoutingManager.isPreferredCommunicationDeviceActive(
                         priorityAddress,
                         priorityRoutingName,
                     )
-                    if (routed is RoutingState.Active && active) {
+                    if (active) {
                         lines += "Routing: PASS — ${audioRoutingManager.currentCommunicationDeviceLabel()}"
                     } else {
                         failures++
-                        lines += "Routing: FAIL — ${(routed as? RoutingState.Failed)?.reason ?: "route non confermata"}"
+                        lines += when (routed) {
+                            is RoutingState.Yielded ->
+                                "Routing: YIELDED — altra sessione audio ha priorita (${routed.audioMode})"
+                            is RoutingState.Failed -> "Routing: FAIL — ${routed.reason}"
+                            else -> "Routing: FAIL — route prioritaria non attiva"
+                        }
                     }
 
                     if (active) {
@@ -186,8 +189,8 @@ fun HomeScreen(
                         )
                         var step = 2
                         for (source in sources) {
-                            diagnosticStep = "$step/9 ${source.label} — preparati: prima SILENZIO, poi PARLA"
-                            delay(1_000L)
+                            diagnosticStep = "$step/9 ${source.label} — preparati, poi SILENZIO/PARLA"
+                            delay(1_500L)
                             val natural = withContext(Dispatchers.IO) {
                                 audioRoutingManager.testBluetoothMicrophone(
                                     source = source,
@@ -201,8 +204,8 @@ fun HomeScreen(
                             lines += "${source.label} / ROUTE_ATTIVA: ${natural.verdict} — ${natural.actualInput} — RMS ${"%.0f".format(natural.rms)}"
                             step++
 
-                            diagnosticStep = "$step/9 ${source.label} target esplicito — preparati: prima SILENZIO, poi PARLA"
-                            delay(1_000L)
+                            diagnosticStep = "$step/9 ${source.label} target esplicito — preparati, poi SILENZIO/PARLA"
+                            delay(1_500L)
                             val explicit = withContext(Dispatchers.IO) {
                                 audioRoutingManager.testBluetoothMicrophone(
                                     source = source,
@@ -218,7 +221,7 @@ fun HomeScreen(
                         }
                     }
 
-                    diagnosticStep = "8/9 Shizuku force + prova microfono reale"
+                    diagnosticStep = "8/9 Shizuku force isolato + microfono reale"
                     val shizukuReady = shizukuStatus == ShizukuManager.ShizukuStatus.READY &&
                         withContext(Dispatchers.IO) { shizukuManager.awaitServiceReady(3_000L) }
                     val targetStillActive = audioRoutingManager.isPreferredCommunicationDeviceActive(
@@ -234,19 +237,12 @@ fun HomeScreen(
                         } else {
                             val force = withContext(Dispatchers.IO) { shizukuManager.forceBluetoothSco() }
                             val forceOk = force.contains("RESULT=OK", ignoreCase = true)
-                            val routeStillActiveAfterForce =
-                                audioRoutingManager.isPreferredCommunicationDeviceActive(
-                                    priorityAddress,
-                                    priorityRoutingName,
-                                )
                             lines += "Shizuku force COMM+RECORD: ${if (forceOk) "PASS" else "FAIL"}"
-                            lines += "Route target dopo force: ${if (routeStillActiveAfterForce) "PASS" else "FAIL"}"
-                            if (!forceOk || !routeStillActiveAfterForce) failures++
+                            if (!forceOk) failures++
 
-                            if (forceOk && routeStillActiveAfterForce) {
-                                // Give AudioPolicy a settling window and the user time to prepare.
-                                diagnosticStep = "8/9 Shizuku — preparati: prima SILENZIO, poi PARLA"
-                                delay(1_000L)
+                            if (forceOk) {
+                                diagnosticStep = "8/9 Shizuku — preparati, poi SILENZIO/PARLA"
+                                delay(1_500L)
                                 val forcedMic = withContext(Dispatchers.IO) {
                                     audioRoutingManager.testBluetoothMicrophone(
                                         source = MicTestSource.VOICE_RECOGNITION,
@@ -265,18 +261,11 @@ fun HomeScreen(
                             diagnosticStep = "9/9 Ripristino policy Shizuku"
                             val clear = withContext(Dispatchers.IO) { shizukuManager.clearForcedBluetoothSco() }
                             val clearOk = clear.contains("RESULT=CLEARED", ignoreCase = true)
-                            delay(150L)
-                            val routeStillActiveAfterClear =
-                                audioRoutingManager.isPreferredCommunicationDeviceActive(
-                                    priorityAddress,
-                                    priorityRoutingName,
-                                )
                             lines += "Shizuku cleanup: ${if (clearOk) "PASS" else "FAIL"}"
-                            lines += "Route target dopo cleanup: ${if (routeStillActiveAfterClear) "PASS" else "FAIL"}"
-                            if (!clearOk || !routeStillActiveAfterClear) failures++
+                            if (!clearOk) failures++
                         }
                     } else if (!shizukuReady) {
-                        lines += "Shizuku: SKIP — servizio non pronto (funzione facoltativa)"
+                        lines += "Shizuku: SKIP — servizio non pronto (facoltativo)"
                     } else {
                         failures++
                         lines += "Shizuku: NON TESTATO — route prioritaria non piu attiva"
@@ -288,7 +277,6 @@ fun HomeScreen(
                 else "ESITO COMPLETO: $failures controllo/i non superato/i"
                 diagnosticReport = lines.joinToString("\n")
             } catch (cancelled: CancellationException) {
-                // Do not convert lifecycle/navigation cancellation into a fake diagnostic error.
                 throw cancelled
             } catch (t: Throwable) {
                 diagnosticOk = false
@@ -300,11 +288,106 @@ fun HomeScreen(
                         shizukuManager.clearForcedBluetoothScoIfApplied()
                     }
                 }
-                if (!holdWasAlreadyRequested) {
-                    stopRouteHold(clearRoute = false)
+                if (!requestWasAlreadyOutstanding) {
+                    audioRoutingManager.deactivatePreferredRoute(
+                        suppressAutoRouteUntilDisconnect = autoSuppressWasActive,
+                    )
                 }
                 diagnosticRunning = false
                 diagnosticStep = null
+            }
+        }
+    }
+
+    fun launchInverseExclusionProbe() {
+        val target = selectedExclusionDevice ?: return
+        val targetAddress = selectedExclusionAddress ?: return
+        if (exclusionRunning || diagnosticRunning) return
+
+        exclusionRunning = true
+        exclusionSecondsRemaining = VoiceExclusionPolicy.DEFAULT_WINDOW_MS / 1000
+        exclusionReport = null
+
+        scope.launch {
+            val routeTimeline = mutableListOf<String>()
+            var lastRouteLine: String? = null
+            var excludedTargetBecameCurrent = false
+            try {
+                // The inverse experiment must not be contaminated by BTMicFix's positive route.
+                audioRoutingManager.deactivatePreferredRoute(suppressAutoRouteUntilDisconnect = true)
+                shizukuManager.clearForcedBluetoothScoIfApplied()
+
+                val serviceReady = withContext(Dispatchers.IO) {
+                    shizukuManager.awaitServiceReady()
+                }
+                if (!serviceReady) {
+                    exclusionReport = "RESULT=UNAVAILABLE\nShizuku UserService non disponibile"
+                    return@launch
+                }
+
+                val capabilities = withContext(Dispatchers.IO) {
+                    shizukuManager.inspectVoiceExclusionCapabilities()
+                }
+                if (!capabilities.contains("RESULT=AVAILABLE", ignoreCase = true)) {
+                    exclusionReport = capabilities
+                    return@launch
+                }
+
+                val probe = async(Dispatchers.IO) {
+                    shizukuManager.testVoiceDeviceExclusion(
+                        publicType = target.type,
+                        address = targetAddress,
+                        name = target.name,
+                        durationMs = VoiceExclusionPolicy.DEFAULT_WINDOW_MS,
+                    )
+                }
+
+                // Ignore the first second so the timeline cannot count the pre-exclusion
+                // route as a false failure while AudioPolicy is still applying the role.
+                delay(1_000L)
+                val remainingWindowMs = VoiceExclusionPolicy.DEFAULT_WINDOW_MS - 1_000L
+                val deadline = android.os.SystemClock.elapsedRealtime() + remainingWindowMs
+                exclusionSecondsRemaining = (remainingWindowMs / 1000L).toInt()
+                while (!probe.isCompleted && android.os.SystemClock.elapsedRealtime() < deadline + 2_000L) {
+                    val remainingMs = (deadline - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+                    exclusionSecondsRemaining = ((remainingMs + 999L) / 1000L).toInt()
+                    val targetIsCurrent = audioRoutingManager.isCurrentCommunicationDevice(target)
+                    if (targetIsCurrent) excludedTargetBecameCurrent = true
+                    val routeLine = "${audioRoutingManager.currentAudioModeLabel()} -> " +
+                        audioRoutingManager.currentCommunicationDeviceLabel() +
+                        if (targetIsCurrent) " [TARGET_ESCLUSO]" else ""
+                    if (routeLine != lastRouteLine) {
+                        routeTimeline += routeLine
+                        lastRouteLine = routeLine
+                    }
+                    delay(250L)
+                }
+
+                val raw = probe.await()
+                val targetSeenAsCurrent = excludedTargetBecameCurrent
+                exclusionReport = buildString {
+                    appendLine(capabilities)
+                    appendLine("--- TEMPORARY EXCLUSION ---")
+                    appendLine(raw)
+                    appendLine("--- ROUTE TIMELINE ---")
+                    if (routeTimeline.isEmpty()) appendLine("Nessun cambio route osservato")
+                    else routeTimeline.forEach(::appendLine)
+                    appendLine("EXCLUDED_TARGET_SEEN_AS_COMMUNICATION_DEVICE=$targetSeenAsCurrent")
+                    appendLine(
+                        if (targetSeenAsCurrent) {
+                            "INTERPRETAZIONE=Il dispositivo escluso e comparso comunque come communication device: blocco non conclusivo"
+                        } else {
+                            "INTERPRETAZIONE=Durante la finestra il dispositivo escluso non e diventato communication device"
+                        }
+                    )
+                }.trim()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (t: Throwable) {
+                exclusionReport = "RESULT=ERROR\n${t.javaClass.simpleName}: ${t.message}"
+            } finally {
+                exclusionSecondsRemaining = 0
+                exclusionRunning = false
             }
         }
     }
@@ -332,16 +415,16 @@ fun HomeScreen(
         modifier = modifier,
         topBar = {
             TopAppBar(
-                title = { Text("BTMicFix", fontWeight = FontWeight.Bold) },
+                title = { Text("BTMicFix 0.8", fontWeight = FontWeight.Bold) },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = SurfaceDark,
                     titleContentColor = Purple80,
                 ),
                 actions = {
-                    IconButton(onClick = onDetailsClick, enabled = !diagnosticRunning) {
+                    IconButton(onClick = onDetailsClick, enabled = !diagnosticRunning && !exclusionRunning) {
                         Icon(Icons.Default.Info, "Dettagli tecnici", tint = Purple80)
                     }
-                    IconButton(onClick = onSetupClick, enabled = !diagnosticRunning) {
+                    IconButton(onClick = onSetupClick, enabled = !diagnosticRunning && !exclusionRunning) {
                         Icon(Icons.Default.Settings, "Configurazione", tint = Purple80)
                     }
                 },
@@ -360,33 +443,45 @@ fun HomeScreen(
             Spacer(modifier = Modifier.height(6.dp))
             StatusCard(routingState)
 
-            Button(
-                onClick = { startRouteHold() },
-                enabled = priorityAvailable && !diagnosticRunning && !routeHoldRequested &&
-                    routingState !is RoutingState.Routing,
-                modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.buttonColors(containerColor = Purple40),
-            ) {
-                Icon(Icons.Default.PowerSettingsNew, null)
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    if (!priorityAvailable) "Dispositivo prioritario non disponibile"
-                    else if (routeHoldRequested) "Instradamento mantenuto su $priorityDisplayName"
-                    else "Attiva $priorityDisplayName"
-                )
-            }
-
-            if (routingState is RoutingState.Active || routeHoldRequested) {
+            if (!requestOutstanding) {
+                Button(
+                    onClick = {
+                        scope.launch(Dispatchers.IO) {
+                            audioRoutingManager.requestPreferredRoute(
+                                address = priorityAddress,
+                                name = priorityRoutingName,
+                                displayName = priorityDisplayName,
+                                trigger = RoutingPolicy.Trigger.USER_ENABLE,
+                            )
+                        }
+                    },
+                    enabled = priorityAvailable && !diagnosticRunning && !exclusionRunning,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = Purple40),
+                ) {
+                    Icon(Icons.Default.PowerSettingsNew, null)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        if (priorityAvailable) "Attiva preferenza $priorityDisplayName"
+                        else "Dispositivo prioritario non disponibile"
+                    )
+                }
+            } else {
                 OutlinedButton(
                     onClick = {
-                        stopRouteHold(clearRoute = true)
+                        audioRoutingManager.deactivatePreferredRoute()
                         shizukuManager.clearForcedBluetoothScoIfApplied()
                     },
-                    enabled = !diagnosticRunning,
+                    enabled = !diagnosticRunning && !exclusionRunning,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
-                    Text("Disattiva instradamento")
+                    Text("Disattiva preferenza Bluetooth")
                 }
+                Text(
+                    "La preferenza resta registrata, ma BTMicFix non mantiene forzatamente la route: telefono, VoIP e Gemini possono prenderne temporaneamente il controllo. L'app non esegue alcun re-routing automatico durante queste sessioni.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
 
             Card(
@@ -400,14 +495,13 @@ fun HomeScreen(
                 ) {
                     Text("Diagnostica completa", style = MaterialTheme.typography.titleMedium)
                     Text(
-                        "Una sola esecuzione: routing reale, 6 registrazioni PCM (3 sorgenti × 2 modalità) + 1 registrazione VOICE_RECOGNITION sotto forzatura Shizuku, con cleanup finale.",
+                        "Una sola esecuzione: richiesta one-shot, 6 registrazioni PCM reali (3 sorgenti × 2 modalità) e test Shizuku isolato con cleanup finale. La diagnostica non usa route-hold e non imposta AudioManager.mode.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Button(
                         onClick = { requestCompleteDiagnostic() },
-                        enabled = priority != null && !diagnosticRunning &&
-                            routingState !is RoutingState.Routing,
+                        enabled = priority != null && !diagnosticRunning && !exclusionRunning,
                         modifier = Modifier.fillMaxWidth(),
                         colors = ButtonDefaults.buttonColors(containerColor = Purple40),
                     ) {
@@ -459,6 +553,18 @@ fun HomeScreen(
                     }
                 }
             }
+
+            VoiceExclusionProbeCard(
+                candidates = exclusionCandidates,
+                selectedDeviceId = selectedExclusionDeviceId,
+                selectedAddress = selectedExclusionAddress,
+                shizukuReady = shizukuStatus == ShizukuManager.ShizukuStatus.READY,
+                running = exclusionRunning,
+                secondsRemaining = exclusionSecondsRemaining,
+                report = exclusionReport,
+                onSelect = { selectedExclusionDeviceId = it },
+                onRun = { launchInverseExclusionProbe() },
+            )
 
             DeviceSelector(availableDevices)
             ShizukuStatusCard(shizukuManager)
